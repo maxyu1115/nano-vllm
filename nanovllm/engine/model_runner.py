@@ -1,4 +1,5 @@
 import pickle
+from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -14,7 +15,7 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, model_loader: Optional[Callable[[], torch.nn.Module]], config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -28,8 +29,11 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        if model_loader is not None:
+            self.model = model_loader()
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
+            load_model(self.model, config.model_path)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()

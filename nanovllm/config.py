@@ -1,11 +1,12 @@
 import os
 from dataclasses import dataclass
+from typing import Optional
 from transformers import AutoConfig
 
 
 @dataclass
 class Config:
-    model: str
+    model_path: Optional[str] = None
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
@@ -18,9 +19,12 @@ class Config:
     num_kvcache_blocks: int = -1
 
     def __post_init__(self):
-        assert os.path.isdir(self.model)
+        if self.model_path is not None:
+            assert os.path.isdir(self.model_path)
+            self.hf_config = AutoConfig.from_pretrained(self.model_path)
+        else:
+            assert self.hf_config is not None
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
-        self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len

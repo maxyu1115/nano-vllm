@@ -1,9 +1,11 @@
 import atexit
 from dataclasses import fields
 from time import perf_counter
+from typing import Callable, Optional
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
+import torch.nn as nn
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
@@ -14,10 +16,10 @@ from nanovllm.engine.model_runner import ModelRunner
 
 class LLMEngine:
 
-    def __init__(self, model, **kwargs):
+    def __init__(self, model_loader: Optional[Callable[[], nn.Module]] = None, tokenizer_loader: Optional[Callable[[], AutoTokenizer]] = None, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
+        config = Config(**config_kwargs)
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -27,8 +29,12 @@ class LLMEngine:
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.model_runner = ModelRunner(model_loader, config, 0, self.events)
+        if tokenizer_loader is not None:
+            self.tokenizer = tokenizer_loader()
+        else:
+            assert config.model_path is not None
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model_path, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
