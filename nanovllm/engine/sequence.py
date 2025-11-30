@@ -1,9 +1,11 @@
 from copy import copy
 from enum import Enum, auto
-from itertools import count
+from itertools import chain, count
 
 from nanovllm.sampling_params import SamplingParams
 
+
+INVALID_TOKEN_ID = -1
 
 class SequenceStatus(Enum):
     WAITING = auto()
@@ -19,12 +21,15 @@ class Sequence:
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
+        self.uncompressed_token_ids_by_block: list[list[int]] = [copy(token_ids)]
+        self.last_uncompressed_cot_ids: tuple[int, ...] = ()
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
-        self.block_table = []
+        self.block_table: list[int] = []
         self.temperature = sampling_params.temperature
+        self.mtp_temperature = sampling_params.mtp_temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
@@ -61,16 +66,39 @@ class Sequence:
     @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
+    
+    @property
+    def uncompressed_token_ids(self):
+        return list(chain.from_iterable(self.uncompressed_token_ids_by_block))
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def append_token(self, token_id: int):
+        if self.num_tokens % self.block_size == 0:
+            self.uncompressed_token_ids_by_block.append([token_id])
+        else:
+            self.uncompressed_token_ids_by_block[-1].append(token_id)
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
 
+    def uncompressed_block(self, i):
+        assert 0 <= i < self.num_blocks
+        return copy(self.uncompressed_token_ids_by_block[i])
+
+    def append_soft_mtp_tokens(self, token_ids: tuple[int, ...]):
+        if self.num_tokens % self.block_size == 0:
+            self.uncompressed_token_ids_by_block.append(list(token_ids))
+        else:
+            self.uncompressed_token_ids_by_block[-1].extend(token_ids)
+        # self.last_uncompressed_cot_ids = copy(token_ids)
+        self.token_ids.append(INVALID_TOKEN_ID)
+        self.last_token = INVALID_TOKEN_ID
+        self.num_tokens += 1
+
+    # TODO: add uncompressed_token_ids to state
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)

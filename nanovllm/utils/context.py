@@ -15,6 +15,7 @@ class Context:
 
 
 DEFAULT_CONTEXT_KEY = "default"
+MTP_MODULE_CONTEXT_KEY = "mtp_module"
 
 _CONTEXTS = {
     DEFAULT_CONTEXT_KEY: Context()

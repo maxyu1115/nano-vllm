@@ -8,21 +8,30 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.layers.attention import Attention
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context, DEFAULT_CONTEXT_KEY
+from nanovllm.utils.context import set_context, get_context, reset_context, DEFAULT_CONTEXT_KEY, MTP_MODULE_CONTEXT_KEY
 from nanovllm.utils.loader import load_model
 
+
+BATCH_SIZE_LIMIT = 512
+
+INVALID_BLOCK_ID = -1
 
 class ModelRunner:
 
     def __init__(self, model_loader: Optional[Callable[[], torch.nn.Module]], config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
+        self.soft_mtp_enabled = config.max_soft_mtp_tokens > 1
+        self.max_soft_mtp_tokens = config.max_soft_mtp_tokens
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+
+        self.cot_pad_token = config.cot_pad_token
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -98,7 +107,7 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
+        self.run(seqs, True, self.soft_mtp_enabled)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -110,24 +119,30 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        num_layers = 0
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                num_layers += 1
+        block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, num_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+            if isinstance(module, Attention):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+        assert layer_id == num_layers
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        # TODO: check if we need to special handle mtp
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        block_tables = [seq.block_table + [INVALID_BLOCK_ID] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def _prepare_prefill(self, context_key: str, seqs: list[Sequence], right_reserve_tokens: int = 0):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -137,8 +152,8 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
+            seqlen = len(seq) - right_reserve_tokens
+            input_ids.extend(seq[seq.num_cached_tokens:seqlen])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
@@ -148,12 +163,12 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
+            for i in range(seq.num_cached_blocks, len(seq.block_table)):
                 start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
+                if i != len(seq.block_table) - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens 
+                    end = start + seq.last_block_num_tokens - right_reserve_tokens 
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
@@ -162,8 +177,14 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+        assert input_ids.numel() == positions.numel(), f"input_ids.numel()={input_ids.numel()} != positions.numel()={positions.numel()}"
+        if block_tables is not None:
+            assert input_ids.numel() == slot_mapping.numel(), f"input_ids.numel()={input_ids.numel()} != slot_mapping.numel()={slot_mapping.numel()}"
+            assert slot_mapping.numel() == cu_seqlens_q[-1], f"slot_mapping.numel()={slot_mapping.numel()} != cu_seqlens_q[-1]={cu_seqlens_q[-1]}"
+
         set_context(
-            key=DEFAULT_CONTEXT_KEY,
+            key=context_key,
             is_prefill=True,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
@@ -173,6 +194,25 @@ class ModelRunner:
             block_tables=block_tables,
         )
         return input_ids, positions
+
+    def prepare_prefill(self, seqs: list[Sequence]):
+        assert not self.soft_mtp_enabled, "Normal prefilling is not supported in soft MTP mode"
+        return self._prepare_prefill(DEFAULT_CONTEXT_KEY, seqs)
+
+    def prepare_soft_mtp_prefill(self, seqs: list[Sequence]):
+        # In the case of soft MTP prefilling, the normal prefill is what we want for the MTP module.
+        # For the main model, we prefill 1 less token. This is because the MTP module always sees the output from
+        # the main model.
+        # So during prefilling, we initialize the MTP module to see the last prompt token, but the main model will
+        # only see the last token as the first decoding token.
+        assert self.max_soft_mtp_tokens == 2, "Current Soft MTP prefilling only supports 2 tokens"
+        input_ids, positions = self._prepare_prefill(DEFAULT_CONTEXT_KEY, seqs, right_reserve_tokens=self.max_soft_mtp_tokens-1)
+        mtp_input_ids, mtp_positions = self._prepare_prefill(MTP_MODULE_CONTEXT_KEY, seqs, right_reserve_tokens=0)
+        for seq in seqs:
+            # additionally, we pad the CoT with the cot_pad_token
+            seq.last_uncompressed_cot_ids = (seq.token_ids[-1], self.cot_pad_token)
+
+        return input_ids, positions, mtp_input_ids, mtp_positions
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
@@ -198,20 +238,64 @@ class ModelRunner:
         )
         return input_ids, positions
 
-    def prepare_sample(self, seqs: list[Sequence]):
+    def prepare_soft_mtp_decode(self, seqs: list[Sequence]):
+        mtp_input_ids = []
+        positions = []
+        mtp_positions = []
+        slot_mapping = []
+        mtp_slot_mapping = []
+        context_lens = []
+        for seq in seqs:
+            # In soft mtp mode, we pass in multiple input tokens, but the transformer only sees 1 token
+            # This is because the multiple input tokens are compressed into 1 token before fed into the transformer.
+            assert len(seq.last_uncompressed_cot_ids) == self.max_soft_mtp_tokens
+            mtp_input_ids.append(seq.last_uncompressed_cot_ids)
+            positions.append(len(seq) - 1)
+            mtp_positions.append(len(seq) - 1 + 1)
+            context_lens.append(len(seq))
+            if len(seq.block_table) != seq.num_blocks:
+                # this is the case when we allocated an additional block for the MTP module.
+                # Meaning the last tokens fall on the block boundary
+                slot_mapping.append(seq.block_table[-2] * self.block_size + seq.last_block_num_tokens  - 1)
+                mtp_slot_mapping.append(seq.block_table[-1] * self.block_size)
+            else:
+                slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+                mtp_slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens)
+
+        mtp_input_ids = torch.tensor(mtp_input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        mtp_positions = torch.tensor(mtp_positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        mtp_slot_mapping = torch.tensor(mtp_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        mtp_context_lens = context_lens + 1
+        block_tables = self.prepare_block_tables(seqs)
+        set_context(key=DEFAULT_CONTEXT_KEY, is_prefill=False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        # MTP module positions are off by 1
+        set_context(key=MTP_MODULE_CONTEXT_KEY, is_prefill=False, slot_mapping=mtp_slot_mapping, context_lens=mtp_context_lens, block_tables=block_tables)
+        return mtp_input_ids, positions, mtp_positions
+
+    def prepare_sample(self, seqs: list[Sequence]) -> tuple[torch.Tensor, torch.Tensor]:
         temperatures = []
         for seq in seqs:
             temperatures.append(seq.temperature)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+        if not self.soft_mtp_enabled:
+            return temperatures, None
+        mtp_temperatures = []
+        for seq in seqs:
+            mtp_temperatures.append(seq.mtp_temperature)
+        mtp_temperatures = torch.tensor(mtp_temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        return temperatures, mtp_temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    def run_model(self, seqs: list[Sequence], is_prefill: bool):
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        if is_prefill or self.enforce_eager or input_ids.size(0) > BATCH_SIZE_LIMIT:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
-            context = get_context()
+            context = get_context(DEFAULT_CONTEXT_KEY)
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
@@ -224,19 +308,64 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+    @torch.inference_mode()
+    def run_model_mtp(self, seqs: list[Sequence], is_prefill: bool, temperatures: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_prefill:
+            input_ids, positions, mtp_input_ids, mtp_positions = self.prepare_soft_mtp_prefill(seqs)
+            self.model.mtp_prefill(input_ids, positions, mtp_input_ids, mtp_positions)
+            return None, None
+        else:
+            mtp_input_ids, positions, mtp_positions = self.prepare_soft_mtp_decode(seqs)
+            if self.enforce_eager or mtp_input_ids.size(0) > BATCH_SIZE_LIMIT:
+                ntp_tokens, mtp_hidden_states = self.model.mtp_forward(mtp_input_ids, positions, mtp_positions, temperatures)
+                return ntp_tokens, self.model.compute_logits(mtp_hidden_states)
+            bs = mtp_input_ids.size(0)
+            context = get_context(DEFAULT_CONTEXT_KEY)
+            mtp_context = get_context(MTP_MODULE_CONTEXT_KEY)
+            graph = self.mtp_graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph_vars = self.mtp_graph_vars
+            graph_vars["multi_input_ids"][:bs] = mtp_input_ids
+            graph_vars["positions"][:bs] = positions
+            graph_vars["mtp_positions"][:bs] = mtp_positions
+            graph_vars["temperatures"][:bs] = temperatures
+            graph_vars["slot_mapping"].fill_(-1)
+            graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            graph_vars["mtp_slot_mapping"].fill_(-1)
+            graph_vars["mtp_slot_mapping"][:bs] = mtp_context.slot_mapping
+            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"][:bs] = context.context_lens
+            graph_vars["mtp_context_lens"].zero_()
+            graph_vars["mtp_context_lens"][:bs] = mtp_context.context_lens
+            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            graph.replay()
+            return graph_vars["ntp_tokens"][:bs], self.model.compute_logits(graph_vars["mtp_outputs"][:bs])
+
+    def run(self, seqs: list[Sequence], is_prefill: bool, is_soft_mtp: bool) -> list[int] | list[list[int]]:
+        # NOTE: is_soft_mtp and self.soft_mtp_enabled are not the same. is_soft_mtp can be false for non-mtp generation
+        if is_soft_mtp:
+            temperatures, mtp_temperatures = self.prepare_sample(seqs)
+            ntp_tokens, mtp_logits = self.run_model_mtp(seqs, is_prefill, temperatures)
+            if is_prefill:
+                return None
+            if self.rank == 0:
+                mtp_tokens = self.sampler(mtp_logits, mtp_temperatures)
+                token_ids = torch.stack([ntp_tokens, mtp_tokens], dim=1).tolist()
+            else:
+                token_ids = None
+            return token_ids
+        else:
+            temperatures, _ = self.prepare_sample(seqs) if self.rank == 0 else (None, None)
+            logits = self.run_model(seqs, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
+        max_soft_mtp_tokens = config.max_soft_mtp_tokens
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = min(self.config.max_num_seqs, BATCH_SIZE_LIMIT)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
@@ -246,6 +375,7 @@ class ModelRunner:
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
+        self.mtp_graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
@@ -257,9 +387,9 @@ class ModelRunner:
                 context_lens=context_lens[:bs],
                 block_tables=block_tables[:bs],
             )
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            outputs[:bs] = self.model.forward(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                outputs[:bs] = self.model.forward(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
@@ -274,3 +404,37 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+        if self.soft_mtp_enabled:
+            multi_input_ids = torch.zeros(max_bs, max_soft_mtp_tokens, dtype=torch.int64)
+            mtp_positions = torch.zeros(max_bs, dtype=torch.int64)
+            mtp_slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+            mtp_context_lens = torch.zeros(max_bs, dtype=torch.int32)
+            temperatures = torch.zeros(max_bs, dtype=torch.float32)
+            ntp_tokens = torch.zeros(max_bs, dtype=torch.int64)
+            mtp_outputs = torch.zeros(max_bs, hf_config.hidden_size)
+            for bs in reversed(self.graph_bs):
+                graph = torch.cuda.CUDAGraph()
+                set_context(DEFAULT_CONTEXT_KEY, False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+                set_context(MTP_MODULE_CONTEXT_KEY, False, slot_mapping=mtp_slot_mapping[:bs], context_lens=mtp_context_lens[:bs], block_tables=block_tables[:bs])
+                ntp_tokens[:bs], mtp_outputs[:bs] = self.model.mtp_forward(multi_input_ids[:bs], positions[:bs], mtp_positions[:bs], temperatures[:bs])    # warmup
+                # use the same graph pool as the ntp graph
+                with torch.cuda.graph(graph, self.graph_pool):
+                    ntp_tokens[:bs], mtp_outputs[:bs] = self.model.mtp_forward(multi_input_ids[:bs], positions[:bs], mtp_positions[:bs], temperatures[:bs])    # capture
+                self.mtp_graphs[bs] = graph
+                torch.cuda.synchronize()
+                reset_context()
+
+            self.mtp_graph_vars = dict(
+                multi_input_ids=multi_input_ids,
+                positions=positions,
+                mtp_positions=mtp_positions,
+                temperatures=temperatures,
+                slot_mapping=slot_mapping,
+                mtp_slot_mapping=mtp_slot_mapping,
+                context_lens=context_lens,
+                mtp_context_lens=mtp_context_lens,
+                block_tables=block_tables,
+                ntp_tokens=ntp_tokens,
+                mtp_outputs=mtp_outputs,
+            )
