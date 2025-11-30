@@ -3,8 +3,11 @@ from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3Config
 
+from typing import Optional
+
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
+from nanovllm.utils.context import DEFAULT_CONTEXT_KEY
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
@@ -24,6 +27,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        context_key: str = DEFAULT_CONTEXT_KEY,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -63,6 +67,7 @@ class Qwen3Attention(nn.Module):
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
+            context_key=context_key,
         )
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -121,6 +126,7 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        context_key: str = DEFAULT_CONTEXT_KEY,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -133,6 +139,7 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            context_key=context_key,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,

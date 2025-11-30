@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from nanovllm.utils.context import get_context
+from nanovllm.utils.context import get_context, DEFAULT_CONTEXT_KEY
 
 
 @triton.jit
@@ -48,6 +48,7 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        context_key: str = DEFAULT_CONTEXT_KEY,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -55,9 +56,10 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.context_key = context_key
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        context = get_context()
+        context = get_context(self.context_key)
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
