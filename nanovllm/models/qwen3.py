@@ -178,10 +178,14 @@ class Qwen3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
+        input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
@@ -207,13 +211,25 @@ class Qwen3ForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        self.config = config
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def get_output_embeddings(self):
+        return self.lm_head
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
+        input_embeds: Optional[torch.Tensor] = None, # If provided, input_ids is ignored (and should be None)
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        if input_ids is None and input_embeds is None:
+            raise ValueError("Either input_ids or input_embeds must be provided")
+        if input_ids is not None and input_embeds is not None:
+            raise ValueError("Only one of input_ids or input_embeds must be provided")
+        return self.model(input_ids, positions, input_embeds)
 
     def compute_logits(
         self,
