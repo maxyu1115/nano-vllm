@@ -21,7 +21,10 @@ class Sequence:
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
-        self.uncompressed_token_ids_by_block: list[list[int]] = [copy(token_ids)]
+        self.uncompressed_token_ids_by_block: list[list[int]] = [
+            copy(token_ids[i:i+self.block_size]) 
+            for i in range(0, len(token_ids), self.block_size)
+        ]
         self.last_uncompressed_cot_ids: tuple[int, ...] = ()
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
