@@ -103,11 +103,11 @@ class Scheduler:
     def postprocess_reasoning(self, seqs: list[Sequence], mtp_ids: list[list[int]]):
         for seq, token_ids in zip(seqs, mtp_ids):
             seq.append_soft_mtp_tokens(token_ids)
-            if any(t == self.eot for t in token_ids):
-                # move to generation queue
-                self.running_reasoning.remove(seq)
-                self.running_generation.append(seq)
             if seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running_reasoning.remove(seq)
+            elif any(t == self.eot for t in token_ids):
+                # move to generation queue (only if not finished)
+                self.running_reasoning.remove(seq)
+                self.running_generation.append(seq)
