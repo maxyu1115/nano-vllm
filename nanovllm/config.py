@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 from transformers import AutoConfig
 
 
@@ -21,6 +21,8 @@ class Config:
     cot_pad_token: int = -1 # padding token for cot
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+
+    soft_mtp_adaptive_decoding_policy: Literal["threshold", "none"] = "none"
 
     def __post_init__(self):
         if self.model_path is not None:

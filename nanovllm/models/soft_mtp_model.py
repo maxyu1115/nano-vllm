@@ -23,6 +23,6 @@ class SoftMTPInterface:
         positions: torch.Tensor, # (B,)
         mtp_positions: torch.Tensor, # (B,)
         temperatures: torch.Tensor, # (B,)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # returns: (ntp_tokens, mtp_hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # returns: (ntp_tokens, ntp_logits, mtp_hidden_states)
         raise NotImplementedError

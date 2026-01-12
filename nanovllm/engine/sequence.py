@@ -4,6 +4,7 @@ from itertools import chain, count
 
 from nanovllm.sampling_params import SamplingParams
 
+COT_PAD_TOKEN_ID = -1
 
 INVALID_TOKEN_ID = -1
 
@@ -31,10 +32,7 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.block_table: list[int] = []
-        self.temperature = sampling_params.temperature
-        self.mtp_temperature = sampling_params.mtp_temperature
-        self.max_tokens = sampling_params.max_tokens
-        self.ignore_eos = sampling_params.ignore_eos
+        self.sampling_params: SamplingParams = sampling_params
 
     def __len__(self):
         return self.num_tokens
@@ -97,7 +95,11 @@ class Sequence:
         else:
             self.uncompressed_token_ids_by_block[-1].extend(token_ids)
         # self.last_uncompressed_cot_ids = copy(token_ids)
-        self.token_ids.append(INVALID_TOKEN_ID)
+        if token_ids[-1] == COT_PAD_TOKEN_ID:
+            assert len(token_ids) == 2
+            self.token_ids.append(token_ids[0])
+        else:
+            self.token_ids.append(INVALID_TOKEN_ID)
         self.last_token = INVALID_TOKEN_ID
         self.num_tokens += 1
 

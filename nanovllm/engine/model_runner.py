@@ -1,15 +1,17 @@
 import pickle
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+import nanovllm.engine.sequence as sequence
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.soft_mtp import AdaptiveDecodingThresholdPolicy
 from nanovllm.utils.context import set_context, get_context, reset_context, DEFAULT_CONTEXT_KEY, MTP_MODULE_CONTEXT_KEY
 from nanovllm.utils.loader import load_model
 
@@ -31,7 +33,9 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        self.cot_pad_token = config.cot_pad_token
+        sequence.COT_PAD_TOKEN_ID = config.cot_pad_token
+        self.adapt_decode_type: Literal["threshold", "none"] = config.soft_mtp_adaptive_decoding_policy
+        self.adapt_decode_policy = AdaptiveDecodingThresholdPolicy() if self.adapt_decode_type == "threshold" else None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -210,7 +214,7 @@ class ModelRunner:
         mtp_input_ids, mtp_positions = self._prepare_prefill(MTP_MODULE_CONTEXT_KEY, seqs, right_reserve_tokens=0)
         for seq in seqs:
             # additionally, we pad the CoT with the cot_pad_token
-            seq.last_uncompressed_cot_ids = (seq.token_ids[-1], self.cot_pad_token)
+            seq.last_uncompressed_cot_ids = (seq.token_ids[-1], sequence.COT_PAD_TOKEN_ID)
 
         return input_ids, positions, mtp_input_ids, mtp_positions
 
@@ -278,13 +282,13 @@ class ModelRunner:
     def prepare_sample(self, seqs: list[Sequence]) -> tuple[torch.Tensor, torch.Tensor]:
         temperatures = []
         for seq in seqs:
-            temperatures.append(seq.temperature)
+            temperatures.append(seq.sampling_params.temperature)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         if not self.soft_mtp_enabled:
             return temperatures, None
         mtp_temperatures = []
         for seq in seqs:
-            mtp_temperatures.append(seq.mtp_temperature)
+            mtp_temperatures.append(seq.sampling_params.mtp_temperature)
         mtp_temperatures = torch.tensor(mtp_temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures, mtp_temperatures
 
@@ -309,16 +313,16 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     @torch.inference_mode()
-    def run_model_mtp(self, seqs: list[Sequence], is_prefill: bool, temperatures: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def run_model_mtp(self, seqs: list[Sequence], is_prefill: bool, temperatures: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if is_prefill:
             input_ids, positions, mtp_input_ids, mtp_positions = self.prepare_soft_mtp_prefill(seqs)
             self.model.mtp_prefill(input_ids, positions, mtp_input_ids, mtp_positions)
-            return None, None
+            return None, None, None
         else:
             mtp_input_ids, positions, mtp_positions = self.prepare_soft_mtp_decode(seqs)
             if self.enforce_eager or mtp_input_ids.size(0) > BATCH_SIZE_LIMIT:
-                ntp_tokens, mtp_hidden_states = self.model.mtp_forward(mtp_input_ids, positions, mtp_positions, temperatures)
-                return ntp_tokens, self.model.compute_logits(mtp_hidden_states)
+                ntp_tokens, ntp_logits, mtp_hidden_states = self.model.mtp_forward(mtp_input_ids, positions, mtp_positions, temperatures)
+                return ntp_tokens, ntp_logits, self.model.compute_logits(mtp_hidden_states)
             bs = mtp_input_ids.size(0)
             context = get_context(DEFAULT_CONTEXT_KEY)
             mtp_context = get_context(MTP_MODULE_CONTEXT_KEY)
@@ -338,17 +342,29 @@ class ModelRunner:
             graph_vars["mtp_context_lens"][:bs] = mtp_context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return graph_vars["ntp_tokens"][:bs], self.model.compute_logits(graph_vars["mtp_outputs"][:bs])
+            return graph_vars["ntp_tokens"][:bs], graph_vars["ntp_logits"][:bs], self.model.compute_logits(graph_vars["mtp_outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool, is_soft_mtp: bool) -> list[int] | list[list[int]]:
         # NOTE: is_soft_mtp and self.soft_mtp_enabled are not the same. is_soft_mtp can be false for non-mtp generation
         if is_soft_mtp:
             temperatures, mtp_temperatures = self.prepare_sample(seqs)
-            ntp_tokens, mtp_logits = self.run_model_mtp(seqs, is_prefill, temperatures)
+            ntp_tokens, ntp_logits, mtp_logits = self.run_model_mtp(seqs, is_prefill, temperatures)
             if is_prefill:
                 return None
             if self.rank == 0:
                 mtp_tokens = self.sampler(mtp_logits, mtp_temperatures)
+                ignore_mtp_tokens = torch.zeros_like(mtp_tokens, dtype=torch.bool).cuda(non_blocking=True)
+                if self.adapt_decode_type == "threshold":
+                    ntp_thresholds = torch.tensor(
+                        [seq.sampling_params.mtp_adaptive_decoding_config.ntp_threshold if seq.sampling_params.mtp_adaptive_decoding_config is not None else 0 for seq in seqs],
+                        dtype=torch.float32,
+                    ).cuda(non_blocking=True)
+                    mtp_thresholds = torch.tensor(
+                        [seq.sampling_params.mtp_adaptive_decoding_config.mtp_threshold if seq.sampling_params.mtp_adaptive_decoding_config is not None else 0 for seq in seqs],
+                        dtype=torch.float32,
+                    ).cuda(non_blocking=True)
+                    ignore_mtp_tokens = self.adapt_decode_policy(ntp_logits, mtp_logits, ntp_thresholds, mtp_thresholds)
+                mtp_tokens[ignore_mtp_tokens] = sequence.COT_PAD_TOKEN_ID
                 token_ids = torch.stack([ntp_tokens, mtp_tokens], dim=1).tolist()
             else:
                 token_ids = None
@@ -412,15 +428,16 @@ class ModelRunner:
             mtp_context_lens = torch.zeros(max_bs, dtype=torch.int32)
             temperatures = torch.zeros(max_bs, dtype=torch.float32)
             ntp_tokens = torch.zeros(max_bs, dtype=torch.int64)
+            ntp_logits = torch.zeros(max_bs, hf_config.vocab_size, dtype=torch.float32)
             mtp_outputs = torch.zeros(max_bs, hf_config.hidden_size)
             for bs in reversed(self.graph_bs):
                 graph = torch.cuda.CUDAGraph()
                 set_context(DEFAULT_CONTEXT_KEY, False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
                 set_context(MTP_MODULE_CONTEXT_KEY, False, slot_mapping=mtp_slot_mapping[:bs], context_lens=mtp_context_lens[:bs], block_tables=block_tables[:bs])
-                ntp_tokens[:bs], mtp_outputs[:bs] = self.model.mtp_forward(multi_input_ids[:bs], positions[:bs], mtp_positions[:bs], temperatures[:bs])    # warmup
+                ntp_tokens[:bs], ntp_logits[:bs], mtp_outputs[:bs] = self.model.mtp_forward(multi_input_ids[:bs], positions[:bs], mtp_positions[:bs], temperatures[:bs])    # warmup
                 # use the same graph pool as the ntp graph
                 with torch.cuda.graph(graph, self.graph_pool):
-                    ntp_tokens[:bs], mtp_outputs[:bs] = self.model.mtp_forward(multi_input_ids[:bs], positions[:bs], mtp_positions[:bs], temperatures[:bs])    # capture
+                    ntp_tokens[:bs], ntp_logits[:bs], mtp_outputs[:bs] = self.model.mtp_forward(multi_input_ids[:bs], positions[:bs], mtp_positions[:bs], temperatures[:bs])    # capture
                 self.mtp_graphs[bs] = graph
                 torch.cuda.synchronize()
                 reset_context()
@@ -436,5 +453,6 @@ class ModelRunner:
                 mtp_context_lens=mtp_context_lens,
                 block_tables=block_tables,
                 ntp_tokens=ntp_tokens,
+                ntp_logits=ntp_logits,
                 mtp_outputs=mtp_outputs,
             )
