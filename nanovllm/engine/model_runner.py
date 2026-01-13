@@ -350,6 +350,7 @@ class ModelRunner:
             temperatures, mtp_temperatures = self.prepare_sample(seqs)
             ntp_tokens, ntp_logits, mtp_logits = self.run_model_mtp(seqs, is_prefill, temperatures)
             if is_prefill:
+                reset_context()
                 return None
             if self.rank == 0:
                 mtp_tokens = self.sampler(mtp_logits, mtp_temperatures)
@@ -368,6 +369,7 @@ class ModelRunner:
                 token_ids = torch.stack([ntp_tokens, mtp_tokens], dim=1).tolist()
             else:
                 token_ids = None
+            reset_context()
             return token_ids
         else:
             temperatures, _ = self.prepare_sample(seqs) if self.rank == 0 else (None, None)

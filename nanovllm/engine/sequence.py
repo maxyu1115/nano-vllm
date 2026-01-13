@@ -94,7 +94,7 @@ class Sequence:
             self.uncompressed_token_ids_by_block.append(list(token_ids))
         else:
             self.uncompressed_token_ids_by_block[-1].extend(token_ids)
-        # self.last_uncompressed_cot_ids = copy(token_ids)
+        self.last_uncompressed_cot_ids = tuple(token_ids)
         if token_ids[-1] == COT_PAD_TOKEN_ID:
             assert len(token_ids) == 2
             self.token_ids.append(token_ids[0])
