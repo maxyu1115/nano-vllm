@@ -8,21 +8,36 @@ class SoftMTPInterface:
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
     
-    def mtp_prefill(
+    def ntp_prefill(
         self,
         input_ids: torch.Tensor, # (S,)
         positions: torch.Tensor, # (S,)
-        mtp_input_ids: torch.Tensor, # (S+B,)
-        mtp_positions: torch.Tensor, # (S+B,)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        # returns: ntp_hidden_states
         raise NotImplementedError
 
-    def mtp_forward(
+    def ntp_decode(
         self,
-        multi_input_ids: torch.Tensor, # (B,k)
+        multi_input_ids: torch.Tensor, # (B, k)
         positions: torch.Tensor, # (B,)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # returns: (ntp_hidden_states, multi_input_embeds)
+        raise NotImplementedError
+
+    def mtp_prefill(
+        self,
+        mtp_input_ids: torch.Tensor, # (S+B,)
+        mtp_positions: torch.Tensor, # (S+B,)
+    ) -> torch.Tensor:
+        # returns: mtp_hidden_states
+        raise NotImplementedError
+
+    def mtp_decode(
+        self,
+        multi_input_embeds: torch.Tensor, # (B, k, H)
+        ntp_hidden_states: torch.Tensor, # (B, H)
+        ntp_output_ids: torch.Tensor, # (B,)
         mtp_positions: torch.Tensor, # (B,)
-        temperatures: torch.Tensor, # (B,)
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # returns: (ntp_tokens, ntp_logits, mtp_hidden_states)
+    ) -> torch.Tensor:
+        # returns: mtp_hidden_states
         raise NotImplementedError
