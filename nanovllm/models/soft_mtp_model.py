@@ -1,8 +1,9 @@
 import torch
-
+from nanovllm.utils.context import DEFAULT_CONTEXT_KEY
 
 class SoftMTPInterface:    
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def compute_logits(self, hidden_states: torch.Tensor, context_key: str = DEFAULT_CONTEXT_KEY) -> torch.Tensor:
+        # the context key should be passed as is to the lm_head
         raise NotImplementedError
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:

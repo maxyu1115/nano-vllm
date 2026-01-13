@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nanovllm.utils.context import get_context
+from nanovllm.utils.context import get_context, DEFAULT_CONTEXT_KEY
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -53,8 +53,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 
-    def forward(self, x: torch.Tensor):
-        context = get_context()
+    def forward(self, x: torch.Tensor, context_key: str = DEFAULT_CONTEXT_KEY):
+        context = get_context(context_key)
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()

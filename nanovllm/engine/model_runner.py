@@ -362,7 +362,7 @@ class ModelRunner:
             ntp_logits = graph_vars["ntp_logits"][:bs]
             mtp_hidden_states = graph_vars["mtp_outputs"][:bs]
 
-        mtp_logits = self.model.compute_logits(mtp_hidden_states)
+        mtp_logits = self.model.compute_logits(mtp_hidden_states, MTP_MODULE_CONTEXT_KEY)
 
         if self.rank == 0:
             mtp_tokens = self.sampler(mtp_logits, mtp_temperatures)
