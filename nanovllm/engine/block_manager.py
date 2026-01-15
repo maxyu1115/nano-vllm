@@ -35,6 +35,7 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
         self.max_soft_mtp_tokens = max_soft_mtp_tokens
         self.soft_mtp_enabled = max_soft_mtp_tokens > 1
+        assert max_soft_mtp_tokens <= 2, "Current Soft MTP prefill_allocate only supports 2 tokens"
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -64,12 +65,22 @@ class BlockManager:
         assert not seq.block_table
         h = INVALID_BLOCK_HASH
         cache_miss = False
-        for i in range(seq.num_blocks):
-            token_ids = seq.block(i)
-            block_len = len(token_ids)
-            if self.soft_mtp_enabled:
-                # for soft mtp, we use the uncompressed token ids to compute the hash
-                token_ids = seq.uncompressed_block(i)
+        # When we are in soft MTP mode and the last block is full, we need to allocate an
+        # additional block for the MTP module, since it is off by 1.
+        soft_mtp_special_case = self.soft_mtp_enabled and seq.last_block_num_tokens == self.block_size
+        num_blocks = seq.num_blocks if not soft_mtp_special_case else seq.num_blocks + 1
+        for i in range(num_blocks):
+            if soft_mtp_special_case and i == num_blocks - 1:
+                # in this case, we are allocating an additional block for the MTP module.
+                # Use -1 just as a random placeholder. The actual number doesn't matter
+                token_ids = [-1]
+                block_len = len(token_ids)
+            else:
+                token_ids = seq.block(i)
+                block_len = len(token_ids)
+                if self.soft_mtp_enabled:
+                    # for soft mtp, we use the uncompressed token ids to compute the hash
+                    token_ids = seq.uncompressed_block(i)
 
             h = self.compute_hash(token_ids, h) if block_len == self.block_size else INVALID_BLOCK_HASH
             # h != INVALID_BLOCK_HASH means we need to assign a new block to this sequence

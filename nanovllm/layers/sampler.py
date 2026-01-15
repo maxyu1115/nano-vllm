@@ -32,6 +32,6 @@ class Sampler(nn.Module):
         sampled_tokens = noisy_probs.argmax(dim=-1)
 
         # Select between greedy and sampled tokens in a tensor-friendly way for torch.compile.
-        is_greedy = (temperatures == 0)
+        is_greedy = (temperatures < 1e-6)
         output_tokens = torch.where(is_greedy, greedy_tokens, sampled_tokens)
         return output_tokens

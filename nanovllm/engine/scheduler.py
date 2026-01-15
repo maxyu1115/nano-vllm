@@ -87,6 +87,9 @@ class Scheduler:
         return scheduled_seqs, False, True
 
     def preempt(self, seq: Sequence):
+        if self.soft_mtp_enabled:
+            # TODO: implement preemption for soft MTP
+            raise NotImplementedError("Preemption not supported for soft MTP")
         # pause this sequence to free up resources
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)

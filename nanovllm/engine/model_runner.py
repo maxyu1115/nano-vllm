@@ -48,7 +48,9 @@ class ModelRunner:
             self.model = Qwen3ForCausalLM(hf_config)
             load_model(self.model, config.model_path)
         self.sampler = Sampler()
+        print("model loaded")
         self.warmup_model()
+        print("warmup done")
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -146,7 +148,7 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def _prepare_prefill(self, context_key: str, seqs: list[Sequence], right_reserve_tokens: int = 0):
+    def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -156,7 +158,7 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            seqlen = len(seq) - right_reserve_tokens
+            seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:seqlen])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
@@ -170,9 +172,16 @@ class ModelRunner:
             for i in range(seq.num_cached_blocks, len(seq.block_table)):
                 start = seq.block_table[i] * self.block_size
                 if i != len(seq.block_table) - 1:
+                    # assert self.max_soft_mtp_tokens <= 2, "This breaks with k>2"
+                    # if not the last block, we can use the full block size
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens - right_reserve_tokens 
+                    # in the case of soft_mtp_enabled, the last block may be pre-allocated for the
+                    # MTP module's prefill decoding. Skip in that case
+                    if self.soft_mtp_enabled and seq.last_block_num_tokens < self.max_soft_mtp_tokens - 1:
+                        continue
+                    else:
+                        end = start + seq.last_block_num_tokens
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
@@ -188,7 +197,7 @@ class ModelRunner:
             assert slot_mapping.numel() == cu_seqlens_q[-1], f"slot_mapping.numel()={slot_mapping.numel()} != cu_seqlens_q[-1]={cu_seqlens_q[-1]}"
 
         set_context(
-            key=context_key,
+            key=DEFAULT_CONTEXT_KEY,
             is_prefill=True,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
@@ -197,26 +206,56 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             block_tables=block_tables,
         )
+        if self.soft_mtp_enabled:
+            set_context(
+                key=MTP_MODULE_CONTEXT_KEY,
+                is_prefill=True,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                slot_mapping=slot_mapping,
+                block_tables=block_tables,
+            )
         return input_ids, positions
 
-    def prepare_prefill(self, seqs: list[Sequence]):
-        assert not self.soft_mtp_enabled, "Normal prefilling is not supported in soft MTP mode"
-        return self._prepare_prefill(DEFAULT_CONTEXT_KEY, seqs)
-
-    def prepare_soft_mtp_prefill(self, seqs: list[Sequence]):
-        # In the case of soft MTP prefilling, the normal prefill is what we want for the MTP module.
-        # For the main model, we prefill 1 less token. This is because the MTP module always sees the output from
-        # the main model.
-        # So during prefilling, we initialize the MTP module to see the last prompt token, but the main model will
-        # only see the last token as the first decoding token.
-        assert self.max_soft_mtp_tokens == 2, "Current Soft MTP prefilling only supports 2 tokens"
-        input_ids, positions = self._prepare_prefill(DEFAULT_CONTEXT_KEY, seqs, right_reserve_tokens=self.max_soft_mtp_tokens-1)
-        mtp_input_ids, mtp_positions = self._prepare_prefill(MTP_MODULE_CONTEXT_KEY, seqs, right_reserve_tokens=0)
+    def prepare_soft_mtp_prefill_decode(self, seqs: list[Sequence]):
+        mtp_positions = []
+        mtp_slot_mapping = []
+        mtp_context_lens = []
+        is_warmup = False
         for seq in seqs:
-            # additionally, we pad the CoT with the cot_pad_token
-            seq.last_uncompressed_cot_ids = (seq.token_ids[-1], sequence.COT_PAD_TOKEN_ID)
+            if not seq.block_table:    # warmup
+                is_warmup = True
+                mtp_positions.append(0)
+                mtp_slot_mapping.append(0) # append a dummy values for warmup
+                continue
+            # MTP module positions are off by 1, since the ntp token isn't added to seq yet
+            mtp_positions.append(len(seq))
+            mtp_context_lens.append(len(seq) + 1)
+            mtp_slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens)
 
-        return input_ids, positions, mtp_input_ids, mtp_positions
+        mtp_positions = torch.tensor(mtp_positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        mtp_slot_mapping = torch.tensor(mtp_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        mtp_context_lens = torch.tensor(mtp_context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        
+        if is_warmup:
+            B = len(seqs)
+            cu_seqlens = torch.arange(0, B + 1, dtype=torch.int32, device="cuda")
+            set_context(
+                key=MTP_MODULE_CONTEXT_KEY,
+                is_prefill=True,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=1,
+                max_seqlen_k=1,
+                slot_mapping=mtp_slot_mapping,
+                block_tables=None,
+            )
+        else:
+            block_tables = self.prepare_block_tables(seqs)
+            set_context(key=MTP_MODULE_CONTEXT_KEY, is_prefill=False, slot_mapping=mtp_slot_mapping, context_lens=mtp_context_lens, block_tables=block_tables)
+        return mtp_positions
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
@@ -313,11 +352,34 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     @torch.inference_mode()
-    def run_model_mtp_prefill(self, seqs: list[Sequence], temperatures: torch.Tensor, mtp_temperatures: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        input_ids, positions, mtp_input_ids, mtp_positions = self.prepare_soft_mtp_prefill(seqs)
+    def run_model_mtp_prefill(self, seqs: list[Sequence], temperatures: torch.Tensor, mtp_temperatures: torch.Tensor) -> list[list[int]]:
+        input_ids, positions = self.prepare_prefill(seqs)
         ntp_hidden_states = self.model.ntp_prefill(input_ids, positions)
-        mtp_hidden_states = self.model.mtp_prefill(mtp_input_ids, mtp_positions)
-        return ntp_hidden_states, mtp_hidden_states
+        mtp_hidden_states = self.model.mtp_prefill(input_ids, positions)
+        ntp_logits = self.model.compute_logits(ntp_hidden_states)
+
+        # get the hidden states for the last token of each sequence
+        # TODO: this is technically redundant, since compute_logits already does this select by index. But no good way to extract that output
+        context = get_context(DEFAULT_CONTEXT_KEY)
+        last_indices = context.cu_seqlens_q[1:] - 1
+        ntp_hidden_states = ntp_hidden_states[last_indices].contiguous()
+
+        # TODO: sync across all ranks
+        ntp_tokens = self.sampler(ntp_logits, temperatures)
+
+        reset_context()
+        mtp_positions = self.prepare_soft_mtp_prefill_decode(seqs)
+        
+        multi_input_ids = torch.stack([ntp_tokens, torch.full_like(ntp_tokens, sequence.COT_PAD_TOKEN_ID)], dim=1) # (B, 2)
+        multi_input_embeds = self.model.embed_tokens(multi_input_ids)
+        mtp_hidden_states = self.model.mtp_decode(multi_input_embeds, ntp_hidden_states, ntp_tokens, mtp_positions)
+        mtp_logits = self.model.compute_logits(mtp_hidden_states, MTP_MODULE_CONTEXT_KEY)
+
+        if self.rank == 0:
+            mtp_tokens = self._sample_mtp_logits(seqs, mtp_logits, ntp_logits, mtp_temperatures)
+            return torch.stack([ntp_tokens, mtp_tokens], dim=1).tolist()
+        else:
+            return None
 
     def _run_model_mtp_decode(
         self,
@@ -330,7 +392,7 @@ class ModelRunner:
         ntp_logits = self.model.compute_logits(ntp_hidden_states)
         # TODO: sync across all ranks
         ntp_tokens = self.sampler(ntp_logits, temperatures)
-        mtp_hidden_states = self.model.mtp_decode(multi_input_embeds, ntp_hidden_states, mtp_input_ids, mtp_positions)
+        mtp_hidden_states = self.model.mtp_decode(multi_input_embeds, ntp_hidden_states, ntp_tokens, mtp_positions)
         return ntp_tokens, ntp_logits, mtp_hidden_states
 
     @torch.inference_mode()
@@ -363,7 +425,14 @@ class ModelRunner:
             mtp_hidden_states = graph_vars["mtp_outputs"][:bs]
 
         mtp_logits = self.model.compute_logits(mtp_hidden_states, MTP_MODULE_CONTEXT_KEY)
+        if self.rank == 0:
+            mtp_tokens = self._sample_mtp_logits(seqs, mtp_logits, ntp_logits, mtp_temperatures)
+            return torch.stack([ntp_tokens, mtp_tokens], dim=1).tolist()
+        else:
+            return None
 
+    def _sample_mtp_logits(self, seqs: list[Sequence], mtp_logits: torch.Tensor, ntp_logits: torch.Tensor, mtp_temperatures: torch.Tensor) -> torch.Tensor:
+        mtp_tokens = None
         if self.rank == 0:
             mtp_tokens = self.sampler(mtp_logits, mtp_temperatures)
             ignore_mtp_tokens = torch.zeros_like(mtp_tokens, dtype=torch.bool).cuda(non_blocking=True)
@@ -378,20 +447,16 @@ class ModelRunner:
                 ).cuda(non_blocking=True)
                 ignore_mtp_tokens = self.adapt_decode_policy(ntp_logits, mtp_logits, ntp_thresholds, mtp_thresholds)
             mtp_tokens[ignore_mtp_tokens] = sequence.COT_PAD_TOKEN_ID
-            token_ids = torch.stack([ntp_tokens, mtp_tokens], dim=1).tolist()
-        else:
-            token_ids = None
-        return token_ids
+        return mtp_tokens
 
     def run(self, seqs: list[Sequence], is_prefill: bool, is_soft_mtp: bool) -> list[int] | list[list[int]]:
         # NOTE: is_soft_mtp and self.soft_mtp_enabled are not the same. is_soft_mtp can be false for non-mtp generation
         if is_soft_mtp:
             temperatures, mtp_temperatures = self.prepare_sample(seqs)
             if is_prefill:
-                _, _ = self.run_model_mtp_prefill(seqs, temperatures, mtp_temperatures)
-                reset_context()
-                return None
-            token_ids = self.run_model_mtp_decode(seqs, temperatures, mtp_temperatures)
+                token_ids = self.run_model_mtp_prefill(seqs, temperatures, mtp_temperatures)
+            else:
+                token_ids = self.run_model_mtp_decode(seqs, temperatures, mtp_temperatures)
         else:
             temperatures, _ = self.prepare_sample(seqs) if self.rank == 0 else (None, None)
             logits = self.run_model(seqs, is_prefill)

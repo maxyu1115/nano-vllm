@@ -64,9 +64,6 @@ class LLMEngine:
         seqs, is_prefill, is_soft_mtp = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill, is_soft_mtp)
         if is_soft_mtp:
-            # MTP prefill doesn't produce any tokens
-            if is_prefill:
-                return [], 0
             self.scheduler.postprocess_reasoning(seqs, token_ids)
         else:
             self.scheduler.postprocess_ntp(seqs, token_ids)
