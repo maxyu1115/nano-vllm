@@ -34,6 +34,7 @@ class ModelRunner:
         self.event = event
 
         sequence.COT_PAD_TOKEN_ID = config.cot_pad_token
+        sequence.END_OF_THINK_TOKEN_ID = config.eot
         self.adapt_decode_type: Literal["threshold", "none"] = config.soft_mtp_adaptive_decoding_policy
         self.adapt_decode_policy = AdaptiveDecodingThresholdPolicy() if self.adapt_decode_type == "threshold" else None
 
@@ -291,8 +292,8 @@ class ModelRunner:
         for seq in seqs:
             # In soft mtp mode, we pass in multiple input tokens, but the transformer only sees 1 token
             # This is because the multiple input tokens are compressed into 1 token before fed into the transformer.
-            assert len(seq.last_uncompressed_cot_ids) == self.max_soft_mtp_tokens
-            mtp_input_ids.append(seq.last_uncompressed_cot_ids)
+            assert len(seq.next_input_cot_ids) == self.max_soft_mtp_tokens
+            mtp_input_ids.append(seq.next_input_cot_ids)
             positions.append(len(seq) - 1)
             mtp_positions.append(len(seq) - 1 + 1)
             context_lens.append(len(seq))

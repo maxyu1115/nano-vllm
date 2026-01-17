@@ -105,12 +105,18 @@ class Scheduler:
 
     def postprocess_reasoning(self, seqs: list[Sequence], mtp_ids: list[list[int]]):
         for seq, token_ids in zip(seqs, mtp_ids):
-            seq.append_soft_mtp_tokens(token_ids)
+            if seq.eot_from_mtp_module:
+                seq.apply_eot_from_mtp_module()
+            else:
+                seq.append_soft_mtp_tokens(token_ids)
+
             if seq.num_completion_tokens == seq.sampling_params.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running_reasoning.remove(seq)
-            elif any(t == self.eot for t in token_ids):
-                # move to generation queue (only if not finished)
+            elif token_ids[0] == self.eot:
+                # NTP predicted EOT - immediate transition to generation
+                # (Don't check MTP token here; if only MTP predicted EOT, 
+                # eot_from_mtp_module flag handles the delayed transition)
                 self.running_reasoning.remove(seq)
                 self.running_generation.append(seq)
