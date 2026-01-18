@@ -38,7 +38,7 @@ class ModelRunner:
         self.adapt_decode_type: Literal["threshold", "none"] = config.soft_mtp_adaptive_decoding_policy
         self.adapt_decode_policy = AdaptiveDecodingThresholdPolicy() if self.adapt_decode_type == "threshold" else None
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group("nccl", config.dist_init_method, world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
