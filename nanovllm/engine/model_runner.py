@@ -170,19 +170,16 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, len(seq.block_table)):
+            # in the case of soft_mtp_enabled, the last block may be pre-allocated for the MTP module.
+            # But seq.num_blocks doesn't include that additional block, so we're good
+            for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != len(seq.block_table) - 1:
                     # assert self.max_soft_mtp_tokens <= 2, "This breaks with k>2"
                     # if not the last block, we can use the full block size
                     end = start + self.block_size
                 else:
-                    # in the case of soft_mtp_enabled, the last block may be pre-allocated for the
-                    # MTP module's prefill decoding. Skip in that case
-                    if self.soft_mtp_enabled and seq.last_block_num_tokens < self.max_soft_mtp_tokens - 1:
-                        continue
-                    else:
-                        end = start + seq.last_block_num_tokens
+                    end = start + seq.last_block_num_tokens
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
