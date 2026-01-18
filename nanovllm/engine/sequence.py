@@ -135,14 +135,48 @@ class Sequence:
         self.num_tokens += 1
         self.eot_from_mtp_module = False
 
-    # TODO: add uncompressed_token_ids to state
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+        """
+        Serialize the Sequence for pickling (multiprocessing, checkpointing, etc.).
+        """
+        return {
+            'seq_id': self.seq_id,
+            'status': self.status,
+            'token_ids': self.token_ids,
+            'uncompressed_token_ids_by_block': self.uncompressed_token_ids_by_block,
+            'next_input_cot_ids': self.next_input_cot_ids,
+            'last_token': self.last_token,
+            'num_tokens': self.num_tokens,
+            'num_prompt_tokens': self.num_prompt_tokens,
+            'num_cot_tokens': self.num_cot_tokens,
+            'num_ans_tokens': self.num_ans_tokens,
+            'num_cached_tokens': self.num_cached_tokens,
+            'block_table': self.block_table,
+            'temperature': self.temperature,
+            'max_tokens': self.max_tokens,
+            'ignore_eos': self.ignore_eos,
+            'soft_mtp_params': self.soft_mtp_params,
+            'eot_from_mtp_module': self.eot_from_mtp_module,
+        }
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
-        else:
-            self.last_token = state[-1]
+        """
+        Restore the Sequence from pickled state.
+        """
+        self.seq_id = state['seq_id']
+        self.status = state['status']
+        self.token_ids = state['token_ids']
+        self.uncompressed_token_ids_by_block = state['uncompressed_token_ids_by_block']
+        self.next_input_cot_ids = state['next_input_cot_ids']
+        self.last_token = state['last_token']
+        self.num_tokens = state['num_tokens']
+        self.num_prompt_tokens = state['num_prompt_tokens']
+        self.num_cot_tokens = state['num_cot_tokens']
+        self.num_ans_tokens = state['num_ans_tokens']
+        self.num_cached_tokens = state['num_cached_tokens']
+        self.block_table = state['block_table']
+        self.temperature = state['temperature']
+        self.max_tokens = state['max_tokens']
+        self.ignore_eos = state['ignore_eos']
+        self.soft_mtp_params = state['soft_mtp_params']
+        self.eot_from_mtp_module = state['eot_from_mtp_module']
