@@ -98,7 +98,7 @@ class Scheduler:
     def postprocess_ntp(self, seqs: list[Sequence], token_ids: list[int]):
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
-            if (not seq.sampling_params.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.sampling_params.max_tokens:
+            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running_generation.remove(seq)
@@ -110,7 +110,7 @@ class Scheduler:
             else:
                 seq.append_soft_mtp_tokens(token_ids)
 
-            if seq.num_completion_tokens == seq.sampling_params.max_tokens:
+            if seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running_reasoning.remove(seq)

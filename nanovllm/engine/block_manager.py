@@ -59,6 +59,9 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
+        soft_mtp_special_case = self.soft_mtp_enabled and seq.last_block_num_tokens == self.block_size
+        if soft_mtp_special_case:
+            return len(self.free_block_ids) >= seq.num_blocks + 1
         return len(self.free_block_ids) >= seq.num_blocks
 
     def prefill_allocate(self, seq: Sequence):

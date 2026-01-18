@@ -67,7 +67,7 @@ class LLMEngine:
             self.scheduler.postprocess_reasoning(seqs, token_ids)
         else:
             self.scheduler.postprocess_ntp(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids, seq.uncompressed_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [(seq.seq_id, seq.completion_token_ids, seq.uncompressed_completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 

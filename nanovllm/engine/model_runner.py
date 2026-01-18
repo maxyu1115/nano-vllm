@@ -319,13 +319,16 @@ class ModelRunner:
     def prepare_sample(self, seqs: list[Sequence]) -> tuple[torch.Tensor, torch.Tensor]:
         temperatures = []
         for seq in seqs:
-            temperatures.append(seq.sampling_params.temperature)
+            temperatures.append(seq.temperature)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         if not self.soft_mtp_enabled:
             return temperatures, None
         mtp_temperatures = []
         for seq in seqs:
-            mtp_temperatures.append(seq.sampling_params.mtp_temperature)
+            if seq.soft_mtp_params is None:
+                mtp_temperatures.append(seq.temperature)
+            else:
+                mtp_temperatures.append(seq.soft_mtp_params.mtp_temperature)
         mtp_temperatures = torch.tensor(mtp_temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures, mtp_temperatures
 
@@ -436,11 +439,11 @@ class ModelRunner:
             ignore_mtp_tokens = torch.zeros_like(mtp_tokens, dtype=torch.bool).cuda(non_blocking=True)
             if self.adapt_decode_type == "threshold":
                 ntp_thresholds = torch.tensor(
-                    [seq.sampling_params.mtp_adaptive_decoding_config.ntp_threshold if seq.sampling_params.mtp_adaptive_decoding_config is not None else 0 for seq in seqs],
+                    [seq.soft_mtp_params.adaptive_threshold[0] if seq.soft_mtp_params.adaptive_threshold is not None else 0 for seq in seqs],
                     dtype=torch.float32,
                 ).cuda(non_blocking=True)
                 mtp_thresholds = torch.tensor(
-                    [seq.sampling_params.mtp_adaptive_decoding_config.mtp_threshold if seq.sampling_params.mtp_adaptive_decoding_config is not None else 0 for seq in seqs],
+                    [seq.soft_mtp_params.adaptive_threshold[1] if seq.soft_mtp_params.adaptive_threshold is not None else 0 for seq in seqs],
                     dtype=torch.float32,
                 ).cuda(non_blocking=True)
                 ignore_mtp_tokens = self.adapt_decode_policy(ntp_logits, mtp_logits, ntp_thresholds, mtp_thresholds)

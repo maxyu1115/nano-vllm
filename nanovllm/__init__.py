@@ -1,2 +1,2 @@
 from nanovllm.llm import LLM
-from nanovllm.sampling_params import SamplingParams, MTPAdaptiveDecodingConfig
+from nanovllm.sampling_params import SamplingParams, SoftMTPSamplingParams

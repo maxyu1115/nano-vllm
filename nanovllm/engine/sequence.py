@@ -2,7 +2,7 @@ from copy import copy
 from enum import Enum, auto
 from itertools import chain, count
 
-from nanovllm.sampling_params import SamplingParams
+from nanovllm.sampling_params import SamplingParams, SoftMTPSamplingParams
 
 COT_PAD_TOKEN_ID = -1
 END_OF_THINK_TOKEN_ID = -1
@@ -33,7 +33,10 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.block_table: list[int] = []
-        self.sampling_params: SamplingParams = sampling_params
+        self.temperature = sampling_params.temperature
+        self.max_tokens = sampling_params.max_tokens
+        self.ignore_eos = sampling_params.ignore_eos
+        self.soft_mtp_params: SoftMTPSamplingParams = sampling_params.soft_mtp_params
 
         # When the MTP module generates the EOT token, it will set this flag to True
         # Since we still need to process the token from the NTP module, (and soft embed it with COT_PAD)
@@ -76,8 +79,8 @@ class Sequence:
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
     
     @property
-    def uncompressed_token_ids(self):
-        return list(chain.from_iterable(self.uncompressed_token_ids_by_block))
+    def uncompressed_completion_token_ids(self):
+        return list(chain.from_iterable(self.uncompressed_token_ids_by_block))[self.num_prompt_tokens:]
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
