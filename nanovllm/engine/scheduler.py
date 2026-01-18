@@ -98,7 +98,11 @@ class Scheduler:
     def postprocess_ntp(self, seqs: list[Sequence], token_ids: list[int]):
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            if seq.soft_mtp_params is not None and seq.soft_mtp_params.ans_max_tokens is not None:
+                is_limit = seq.num_ans_tokens == seq.soft_mtp_params.ans_max_tokens
+            else:
+                is_limit = seq.num_completion_tokens == seq.max_tokens
+            if (not seq.ignore_eos and token_id == self.eos) or is_limit:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running_generation.remove(seq)
@@ -108,6 +112,10 @@ class Scheduler:
             if seq.eot_from_mtp_module:
                 seq.apply_eot_from_mtp_module()
             else:
+                if (seq.soft_mtp_params is not None and seq.soft_mtp_params.cot_max_tokens is not None) \
+                    and seq.num_cot_tokens == seq.soft_mtp_params.cot_max_tokens:
+                    # force transition to answer by overriding with EOT token
+                    token_ids = (self.eot, token_ids[1])
                 seq.append_soft_mtp_tokens(token_ids)
 
             if seq.num_completion_tokens == seq.max_tokens:

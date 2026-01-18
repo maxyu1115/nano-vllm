@@ -31,6 +31,8 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
+        self.num_cot_tokens = 0
+        self.num_ans_tokens = 0
         self.num_cached_tokens = 0
         self.block_table: list[int] = []
         self.temperature = sampling_params.temperature
@@ -93,6 +95,7 @@ class Sequence:
             self.uncompressed_token_ids_by_block[-1].append(token_id)
         self.token_ids.append(token_id)
         self.last_token = token_id
+        self.num_ans_tokens += 1
         self.num_tokens += 1
 
     def uncompressed_block(self, i):
@@ -123,6 +126,7 @@ class Sequence:
 
         self.last_token = self.token_ids[-1]
         self.num_tokens += 1
+        self.num_cot_tokens += 1
 
     def apply_eot_from_mtp_module(self):
         # Add the EOT token and increment num_tokens for the soft token from this step
