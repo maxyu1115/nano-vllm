@@ -8,6 +8,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 import nanovllm.engine.sequence as sequence
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.scheduler import RunPhase
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.sampler import Sampler
@@ -114,7 +115,8 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        self.run(seqs, True, self.soft_mtp_enabled)
+        warmup_phase = RunPhase.PREFILL_MTP if self.soft_mtp_enabled else RunPhase.PREFILL
+        self.run(seqs, warmup_phase)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -332,6 +334,254 @@ class ModelRunner:
         mtp_temperatures = torch.tensor(mtp_temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures, mtp_temperatures
 
+    def _compute_slot_mapping(self, seq: Sequence, positions: list[int]) -> list[int]:
+        """Compute slot mapping for given positions in a sequence."""
+        return [seq.block_table[p // self.block_size] * self.block_size + p % self.block_size for p in positions]
+
+    def _set_prefill_context_for_section(
+        self,
+        seqs: list[Sequence],
+        positions_per_seq: list[list[int]],
+        context_len_per_seq: list[int],
+        context_key: str = DEFAULT_CONTEXT_KEY,
+    ):
+        """Set prefill context for a section of tokens across sequences."""
+        all_positions = []
+        slot_mapping = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+
+        for seq, positions, ctx_len in zip(seqs, positions_per_seq, context_len_per_seq):
+            all_positions.extend(positions)
+            slot_mapping.extend(self._compute_slot_mapping(seq, positions))
+            seqlen_q = len(positions)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + ctx_len)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(ctx_len, max_seqlen_k)
+
+        block_tables = self.prepare_block_tables(seqs) if cu_seqlens_k[-1] > cu_seqlens_q[-1] else None
+
+        positions_t = torch.tensor(all_positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping_t = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q_t = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k_t = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+        set_context(
+            key=context_key,
+            is_prefill=True,
+            cu_seqlens_q=cu_seqlens_q_t,
+            cu_seqlens_k=cu_seqlens_k_t,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            slot_mapping=slot_mapping_t,
+            block_tables=block_tables,
+        )
+        return positions_t, cu_seqlens_q_t
+
+    def _extract_restore_data(self, seqs: list[Sequence]) -> tuple[
+        list[list[int]], list[list[int]],  # prompt_tokens, prompt_positions
+        list[list[list[int]]], list[list[int]],  # cot_multi_ids, cot_positions
+    ]:
+        """Extract prompt and CoT data for restore prefill.
+        
+        Returns:
+            prompt_tokens_per_seq: Single tokens for prompt section
+            prompt_positions_per_seq: Positions for prompt tokens
+            cot_multi_ids_per_seq: Multi-token IDs [ntp, mtp] for CoT section
+            cot_positions_per_seq: Positions for CoT tokens
+        """
+        prompt_tokens_per_seq = []
+        prompt_positions_per_seq = []
+        cot_multi_ids_per_seq = []
+        cot_positions_per_seq = []
+
+        for seq in seqs:
+            prompt_len = seq.num_prompt_tokens
+            num_cot = seq.num_cot_tokens
+
+            # Prompt section
+            prompt_tokens_per_seq.append(seq.token_ids[:prompt_len])
+            prompt_positions_per_seq.append(list(range(prompt_len)))
+
+            # CoT section - extract multi_input_ids from uncompressed tokens
+            if num_cot > 0:
+                flat = []
+                for block in seq.uncompressed_token_ids_by_block:
+                    flat.extend(block)
+                cot_multi = []
+                for i in range(num_cot):
+                    ntp_tok = flat[prompt_len + i * 2]
+                    mtp_tok = flat[prompt_len + i * 2 + 1]
+                    cot_multi.append([ntp_tok, mtp_tok])
+                cot_multi_ids_per_seq.append(cot_multi)
+                cot_positions_per_seq.append(list(range(prompt_len, prompt_len + num_cot)))
+            else:
+                cot_multi_ids_per_seq.append([])
+                cot_positions_per_seq.append([])
+
+        return prompt_tokens_per_seq, prompt_positions_per_seq, cot_multi_ids_per_seq, cot_positions_per_seq
+
+    def _restore_prompt_and_cot(
+        self,
+        seqs: list[Sequence],
+        prompt_tokens_per_seq: list[list[int]],
+        prompt_positions_per_seq: list[list[int]],
+        cot_multi_ids_per_seq: list[list[list[int]]],
+        cot_positions_per_seq: list[list[int]],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Restore KV cache for prompt and CoT sections.
+        
+        Performs:
+        1. Prompt section: ntp_prefill + mtp_prefill with single tokens
+        2. CoT section: ntp_decode (in prefill mode) + mtp_decode for compressed multi-tokens
+        
+        Returns:
+            cot_ntp_hidden_states: Hidden states from CoT NTP decode (or None if no CoT)
+            cot_multi_input_embeds: Multi-token embeddings from CoT (or None if no CoT)
+        """
+        # Step 1: Prefill prompt section (NTP + MTP)
+        all_prompt_tokens = [t for tokens in prompt_tokens_per_seq for t in tokens]
+        if all_prompt_tokens:
+            prompt_ctx_lens = [len(tokens) for tokens in prompt_tokens_per_seq]
+            positions_t, _ = self._set_prefill_context_for_section(seqs, prompt_positions_per_seq, prompt_ctx_lens, DEFAULT_CONTEXT_KEY)
+            self._set_prefill_context_for_section(seqs, prompt_positions_per_seq, prompt_ctx_lens, MTP_MODULE_CONTEXT_KEY)
+
+            input_ids = torch.tensor(all_prompt_tokens, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            self.model.ntp_prefill(input_ids, positions_t)
+            self.model.mtp_prefill(input_ids, positions_t)
+            reset_context()
+
+        # Step 2: Prefill CoT section
+        all_cot_multi = [m for multi in cot_multi_ids_per_seq for m in multi]
+        cot_ntp_hidden_states = None
+        cot_multi_input_embeds = None
+        if all_cot_multi:
+            prompt_lens = [seq.num_prompt_tokens for seq in seqs]
+            cot_ctx_lens = [prompt_lens[i] + len(cot_positions_per_seq[i]) for i in range(len(seqs))]
+            positions_t, _ = self._set_prefill_context_for_section(seqs, cot_positions_per_seq, cot_ctx_lens, DEFAULT_CONTEXT_KEY)
+
+            multi_input_ids = torch.tensor(all_cot_multi, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            cot_ntp_hidden_states, cot_multi_input_embeds = self.model.ntp_decode(multi_input_ids, positions_t)
+            reset_context()
+
+            # MTP prefill for CoT
+            mtp_positions_per_seq = [[p + 1 for p in positions] for positions in cot_positions_per_seq]
+            mtp_ctx_lens = [c + 1 for c in cot_ctx_lens]
+            mtp_positions_t, _ = self._set_prefill_context_for_section(seqs, mtp_positions_per_seq, mtp_ctx_lens, MTP_MODULE_CONTEXT_KEY)
+
+            all_ntp_output_ids = [m[0] for m in all_cot_multi]
+            ntp_output_ids = torch.tensor(all_ntp_output_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+
+            self.model.mtp_decode(cot_multi_input_embeds, cot_ntp_hidden_states, ntp_output_ids, mtp_positions_t)
+            reset_context()
+
+        return cot_ntp_hidden_states, cot_multi_input_embeds
+
+    @torch.inference_mode()
+    def _restore_reasoning_phase(
+        self,
+        seqs: list[Sequence],
+        temperatures: torch.Tensor,
+        mtp_temperatures: torch.Tensor,
+    ) -> list[list[int]] | None:
+        """Restore KV cache for sequences in reasoning phase (prompt + CoT).
+        
+        Generates next [ntp_token, mtp_token] pair for continued CoT generation.
+        """
+        # Extract and restore prompt + CoT
+        prompt_tokens, prompt_positions, cot_multi_ids, cot_positions = self._extract_restore_data(seqs)
+        cot_ntp_hidden_states, cot_multi_input_embeds = self._restore_prompt_and_cot(
+            seqs, prompt_tokens, prompt_positions, cot_multi_ids, cot_positions
+        )
+
+        # Update cached tokens
+        for seq in seqs:
+            seq.num_cached_tokens = len(seq)
+
+        # Extract last hidden state per sequence from CoT
+        cot_counts = [len(cot_positions[i]) for i in range(len(seqs))]
+        last_indices = []
+        offset = 0
+        for count in cot_counts:
+            last_indices.append(offset + count - 1)
+            offset += count
+        last_indices = torch.tensor(last_indices, dtype=torch.int64, device=cot_ntp_hidden_states.device)
+        last_ntp_hidden = cot_ntp_hidden_states[last_indices].contiguous()
+
+        # Compute NTP logits and sample
+        ntp_logits = self.model.compute_logits(last_ntp_hidden)
+        ntp_tokens = self.sampler(ntp_logits, temperatures)
+
+        # MTP decode for next prediction
+        mtp_positions = self.prepare_soft_mtp_prefill_decode(seqs)
+        last_multi_embeds = cot_multi_input_embeds[last_indices].contiguous()
+        mtp_hidden_states = self.model.mtp_decode(last_multi_embeds, last_ntp_hidden, ntp_tokens, mtp_positions)
+        mtp_logits = self.model.compute_logits(mtp_hidden_states, MTP_MODULE_CONTEXT_KEY)
+
+        if self.rank == 0:
+            mtp_tokens = self._sample_mtp_logits(seqs, mtp_logits, ntp_logits, mtp_temperatures)
+            return torch.stack([ntp_tokens, mtp_tokens], dim=1).tolist()
+        return None
+
+    @torch.inference_mode()
+    def _restore_generation_phase(
+        self,
+        seqs: list[Sequence],
+        temperatures: torch.Tensor,
+    ) -> list[int] | None:
+        """Restore KV cache for sequences in generation phase (prompt + CoT + answer).
+        
+        Generates next single token for answer generation (no MTP).
+        """
+        # Extract and restore prompt + CoT
+        prompt_tokens, prompt_positions, cot_multi_ids, cot_positions = self._extract_restore_data(seqs)
+        self._restore_prompt_and_cot(seqs, prompt_tokens, prompt_positions, cot_multi_ids, cot_positions)
+
+        # Extract answer data
+        ans_tokens_per_seq = []
+        ans_positions_per_seq = []
+        for seq in seqs:
+            prompt_len = seq.num_prompt_tokens
+            num_cot = seq.num_cot_tokens
+            num_ans = seq.num_ans_tokens
+            ans_start = prompt_len + num_cot
+            ans_tokens_per_seq.append(seq.token_ids[ans_start:ans_start + num_ans])
+            ans_positions_per_seq.append(list(range(ans_start, ans_start + num_ans)))
+
+        # Step 3: Prefill answer section
+        all_ans_tokens = [t for tokens in ans_tokens_per_seq for t in tokens]
+        prompt_lens = [seq.num_prompt_tokens for seq in seqs]
+        cot_lens = [seq.num_cot_tokens for seq in seqs]
+        ans_ctx_lens = [prompt_lens[i] + cot_lens[i] + len(ans_tokens_per_seq[i]) for i in range(len(seqs))]
+        positions_t, _ = self._set_prefill_context_for_section(seqs, ans_positions_per_seq, ans_ctx_lens, DEFAULT_CONTEXT_KEY)
+
+        input_ids = torch.tensor(all_ans_tokens, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        ans_ntp_hidden_states = self.model.ntp_prefill(input_ids, positions_t)
+        reset_context()
+
+        # Update cached tokens
+        for seq in seqs:
+            seq.num_cached_tokens = len(seq)
+
+        # Extract last hidden state per sequence from answer
+        ans_counts = [len(ans_positions_per_seq[i]) for i in range(len(seqs))]
+        last_indices = []
+        offset = 0
+        for count in ans_counts:
+            last_indices.append(offset + count - 1)
+            offset += count
+        last_indices = torch.tensor(last_indices, dtype=torch.int64, device=ans_ntp_hidden_states.device)
+        last_ntp_hidden = ans_ntp_hidden_states[last_indices].contiguous()
+
+        ntp_logits = self.model.compute_logits(last_ntp_hidden)
+        token_ids = self.sampler(ntp_logits, temperatures).tolist() if self.rank == 0 else None
+        reset_context()
+        return token_ids
+
+
     @torch.inference_mode()
     def run_model(self, seqs: list[Sequence], is_prefill: bool):
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -450,18 +700,37 @@ class ModelRunner:
             mtp_tokens[ignore_mtp_tokens] = sequence.COT_PAD_TOKEN_ID
         return mtp_tokens
 
-    def run(self, seqs: list[Sequence], is_prefill: bool, is_soft_mtp: bool) -> list[int] | list[list[int]]:
-        # NOTE: is_soft_mtp and self.soft_mtp_enabled are not the same. is_soft_mtp can be false for non-mtp generation
-        if is_soft_mtp:
-            temperatures, mtp_temperatures = self.prepare_sample(seqs)
-            if is_prefill:
-                token_ids = self.run_model_mtp_prefill(seqs, temperatures, mtp_temperatures)
+    def run(self, seqs: list[Sequence], phase: RunPhase) -> list[int] | list[list[int]]:
+        """Run model inference based on the specified phase.
+        
+        Args:
+            seqs: Sequences to process
+            phase: The run phase determining what operation to perform
+            
+        Returns:
+            For reasoning phases (PREFILL_MTP, RESTORE_REASONING, DECODE_MTP): list[list[int]] of [ntp, mtp] pairs
+            For generation phases (PREFILL, RESTORE_GENERATION, DECODE): list[int] of single tokens
+        """
+        if phase in (RunPhase.PREFILL, RunPhase.DECODE):
+            is_prefill = (phase == RunPhase.PREFILL)
+            if self.rank == 0:
+                temperatures, _ = self.prepare_sample(seqs)
+                logits = self.run_model(seqs, is_prefill=is_prefill)
+                token_ids = self.sampler(logits, temperatures).tolist()
             else:
-                token_ids = self.run_model_mtp_decode(seqs, temperatures, mtp_temperatures)
+                token_ids = None
         else:
-            temperatures, _ = self.prepare_sample(seqs) if self.rank == 0 else (None, None)
-            logits = self.run_model(seqs, is_prefill)
-            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            temperatures, mtp_temperatures = self.prepare_sample(seqs)
+            if phase == RunPhase.PREFILL_MTP:
+                token_ids = self.run_model_mtp_prefill(seqs, temperatures, mtp_temperatures)
+            elif phase == RunPhase.DECODE_MTP:
+                token_ids = self.run_model_mtp_decode(seqs, temperatures, mtp_temperatures)
+            elif phase == RunPhase.RESTORE_REASONING:
+                token_ids = self._restore_reasoning_phase(seqs, temperatures, mtp_temperatures)
+            elif phase == RunPhase.RESTORE_GENERATION:
+                token_ids = self._restore_generation_phase(seqs, temperatures)
+            else:
+                raise ValueError(f"Unknown phase: {phase}")
         reset_context()
         return token_ids
 

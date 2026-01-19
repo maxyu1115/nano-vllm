@@ -10,7 +10,7 @@ import torch.nn as nn
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence, INVALID_TOKEN_ID
-from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.scheduler import Scheduler, RunPhase
 from nanovllm.engine.model_runner import ModelRunner
 
 
@@ -61,14 +61,14 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill, is_soft_mtp = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill, is_soft_mtp)
-        if is_soft_mtp:
+        seqs, phase = self.scheduler.schedule()
+        token_ids = self.model_runner.call("run", seqs, phase)
+        if phase.is_reasoning():
             self.scheduler.postprocess_reasoning(seqs, token_ids)
         else:
             self.scheduler.postprocess_ntp(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids, seq.uncompressed_completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        num_tokens = sum(len(seq) for seq in seqs) if phase.is_prefill() else -len(seqs)
         return outputs, num_tokens
 
     def is_finished(self):
