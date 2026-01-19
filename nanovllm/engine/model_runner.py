@@ -620,9 +620,10 @@ class ModelRunner:
 
         reset_context()
         mtp_positions = self.prepare_soft_mtp_prefill_decode(seqs)
-        
-        multi_input_ids = torch.stack([ntp_tokens, torch.full_like(ntp_tokens, sequence.COT_PAD_TOKEN_ID)], dim=1) # (B, 2)
-        multi_input_embeds = self.model.embed_tokens(multi_input_ids)
+        # In this special case of the first MTP token, we don't have a second input token.
+        # Technically we should pass in COT_PAD_TOKEN_ID, and then mask it out with 0.0, so
+        # instead we just pass in zeros. (And note that the first tokens in multi_input_embeds is not used.)
+        multi_input_embeds = torch.zeros(ntp_tokens.size(0), self.max_soft_mtp_tokens, self.model.config.hidden_size, dtype=torch.bfloat16, device=ntp_tokens.device)
         mtp_hidden_states = self.model.mtp_decode(multi_input_embeds, ntp_hidden_states, ntp_tokens, mtp_positions)
         mtp_logits = self.model.compute_logits(mtp_hidden_states, MTP_MODULE_CONTEXT_KEY)
 
