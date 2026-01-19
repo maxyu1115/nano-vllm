@@ -359,6 +359,7 @@ class Scheduler:
 
             if seq.eot_from_mtp_module:
                 seq.apply_eot_from_mtp_module()
+                token_ids = (self.eot, -1) # swap out token_ids, so we transition to answer phase
             else:
                 if (seq.soft_mtp_params is not None and seq.soft_mtp_params.cot_max_tokens is not None) \
                     and seq.num_cot_tokens == seq.soft_mtp_params.cot_max_tokens:
