@@ -27,8 +27,10 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int, max_soft_mtp_tokens: int = 1):
+    def __init__(self, num_blocks: int, block_size: int, max_soft_mtp_tokens: int = 1,
+                 reserved_ratio: float = 0.10):
         self.block_size = block_size
+        self.num_blocks = num_blocks
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -36,11 +38,42 @@ class BlockManager:
         self.max_soft_mtp_tokens = max_soft_mtp_tokens
         self.soft_mtp_enabled = max_soft_mtp_tokens > 1
         assert max_soft_mtp_tokens <= 2, "Current Soft MTP prefill_allocate only supports 2 tokens"
+        
+        # Adaptive block reservation for decode headroom
+        self.reserved_ratio = reserved_ratio
+        self._reserved_blocks = int(num_blocks * reserved_ratio)
 
     @property
     def free_blocks(self) -> int:
         """Number of free blocks available."""
         return len(self.free_block_ids)
+    
+    @property
+    def available_blocks(self) -> int:
+        """Blocks available for new prefills (respecting reservation for decode)."""
+        return max(0, self.free_blocks - self._reserved_blocks)
+    
+    @property
+    def reserved_blocks(self) -> int:
+        """Current number of reserved blocks."""
+        return self._reserved_blocks
+    
+    def update_reservation(self, avg_gen_length: float, num_running: int):
+        """Dynamically adjust reserved blocks based on expected generation needs.
+        
+        Args:
+            avg_gen_length: Average number of tokens generated per sequence
+            num_running: Number of currently running sequences
+        """
+        # Estimate blocks needed per sequence for remaining generation
+        blocks_per_seq = (avg_gen_length + self.block_size - 1) // self.block_size
+        # Reserve enough for running sequences with 20% buffer
+        estimated_need = int(blocks_per_seq * num_running * 1.2)
+        # Cap at 25% of total blocks to avoid over-reserving
+        max_reserved = self.num_blocks // 4
+        # Use at least the initial ratio-based reservation
+        min_reserved = int(self.num_blocks * self.reserved_ratio)
+        self._reserved_blocks = max(min_reserved, min(estimated_need, max_reserved))
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -124,11 +157,15 @@ class BlockManager:
         return len(self.free_block_ids) >= ((len(seq) + self.max_soft_mtp_tokens - 1) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
+        # NOTE: with recent scheduling changes, may_append may be called but the schedule aborted.
+        # So importantly, max_append needs to be idempotent!
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
 
         if len(seq) % self.block_size == 0:
-            assert last_block.hash == INVALID_BLOCK_HASH
+            if last_block.hash != INVALID_BLOCK_HASH:
+                return
+
             if self.soft_mtp_enabled:
                 token_ids = seq.uncompressed_block(seq.num_blocks-1)
             else:
@@ -140,6 +177,11 @@ class BlockManager:
 
         # we need to allocate a new block if the last MTP modules will need the next block
         if (len(seq) + self.max_soft_mtp_tokens - 1) % self.block_size == 1:
+            # Check if we already have the block allocated (idempotency check)
+            required_block_idx = (len(seq) + self.max_soft_mtp_tokens - 1) // self.block_size
+            if len(block_table) > required_block_idx:
+                return
+
             assert last_block.hash != INVALID_BLOCK_HASH
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)

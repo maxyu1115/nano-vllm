@@ -26,6 +26,11 @@ class Config:
     debug: bool = False
 
     soft_mtp_adaptive_decoding_policy: Literal["threshold", "none"] = "none"
+    
+    # Scheduler tuning parameters
+    reserved_block_ratio: float = 0.10  # Reserve 10% of blocks for decode headroom
+    min_decode_batch_ratio: float = 0.01  # Min batch = 1% of max_num_seqs  
+    proactive_preempt_threshold: float = 0.02  # Preempt when <2% blocks free
 
     def __post_init__(self):
         if self.model_path is not None:
@@ -35,6 +40,8 @@ class Config:
             assert self.hf_config is not None
         assert self.kvcache_block_size == 256, "Sequence assumes block size of 256"
         assert 1 <= self.tensor_parallel_size <= 8
+        if self.hf_config.max_position_embeddings < self.max_model_len:
+            print(f"WARNING: max_model_len is greater than max_position_embeddings, setting max_model_len to {self.hf_config.max_position_embeddings}")
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
 

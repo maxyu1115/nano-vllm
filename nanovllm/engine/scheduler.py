@@ -1,4 +1,5 @@
 from collections import deque
+from dataclasses import dataclass, field
 from enum import Enum, auto
 import time
 import os
@@ -6,6 +7,39 @@ import os
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+
+
+@dataclass
+class SchedulerStats:
+    """Track runtime statistics for adaptive scheduling decisions."""
+    total_completed_sequences: int = 0
+    total_generated_tokens: int = 0
+    # Track recent generation lengths for more responsive adaptation
+    recent_gen_lengths: list = field(default_factory=list)
+    max_recent_samples: int = 100
+    
+    @property
+    def avg_generation_length(self) -> float:
+        """Return average generation length, with conservative default."""
+        if self.total_completed_sequences == 0:
+            return 512.0  # conservative default
+        return self.total_generated_tokens / self.total_completed_sequences
+    
+    @property
+    def recent_avg_generation_length(self) -> float:
+        """Return average of recent completions for faster adaptation."""
+        if not self.recent_gen_lengths:
+            return self.avg_generation_length
+        return sum(self.recent_gen_lengths) / len(self.recent_gen_lengths)
+    
+    def record_completion(self, seq: Sequence):
+        """Record a completed sequence's statistics."""
+        self.total_completed_sequences += 1
+        gen_len = seq.num_completion_tokens
+        self.total_generated_tokens += gen_len
+        self.recent_gen_lengths.append(gen_len)
+        if len(self.recent_gen_lengths) > self.max_recent_samples:
+            self.recent_gen_lengths.pop(0)
 
 
 # Simple CSV logger for scheduler debugging
@@ -50,12 +84,22 @@ class Scheduler:
         self.eos = config.eos
         self.bot = config.bot
         self.eot = config.eot
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size, max_soft_mtp_tokens=config.max_soft_mtp_tokens)
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks, 
+            config.kvcache_block_size, 
+            max_soft_mtp_tokens=config.max_soft_mtp_tokens,
+            reserved_ratio=config.reserved_block_ratio
+        )
         self.waiting: deque[Sequence] = deque()
         self.running_reasoning: deque[Sequence] = deque()
         self.running_generation: deque[Sequence] = deque()
         self.debug = config.debug
         self._preempts = 0  # total preemption count
+        
+        # Adaptive scheduling parameters
+        self.stats = SchedulerStats()
+        self.min_decode_batch_size = max(8, int(config.max_num_seqs * config.min_decode_batch_ratio))
+        self._min_free_blocks = int(config.num_kvcache_blocks * config.proactive_preempt_threshold)
 
     def is_finished(self):
         return not self.waiting and not self.running_reasoning and not self.running_generation
@@ -76,7 +120,64 @@ class Scheduler:
         """Check if a sequence is being restored (was preempted after generating tokens)."""
         return seq.num_cot_tokens > 0 or seq.num_ans_tokens > 0
 
+    def _should_proactively_preempt(self) -> bool:
+        """Check if we should preempt to maintain memory headroom."""
+        if self.block_manager.free_blocks > self._min_free_blocks:
+            return False
+        # Preempt if waiting queue is backing up and we're low on memory
+        num_running = len(self.running_reasoning) + len(self.running_generation)
+        return len(self.waiting) > num_running
+
+    def _proactive_preempt(self, count: int = 1):
+        """Preempt sequences proactively to free blocks.
+        
+        Prefer preempting from reasoning (longer sequences, more blocks to free).
+        """
+        for _ in range(count):
+            if self.running_reasoning:
+                self.preempt(self.running_reasoning.pop())
+            elif self.running_generation:
+                self.preempt(self.running_generation.pop())
+            else:
+                break  # nothing to preempt
+
+    def _should_prioritize_generation(self) -> bool:
+        """Decide whether to prioritize generation or reasoning.
+        
+        Returns True if generation should be prioritized, False if reasoning
+        should be prioritized instead (e.g., when generation batch would be tiny
+        but reasoning batch would be substantial).
+        """
+        gen_count = len(self.running_generation)
+        reason_count = len(self.running_reasoning)
+        
+        # Always prioritize if generation batch would be substantial
+        if gen_count >= self.min_decode_batch_size:
+            return True
+        
+        # If generation batch is tiny but reasoning is large, defer generation
+        if gen_count < self.min_decode_batch_size and reason_count > gen_count * 4:
+            return False
+        
+        # Default: prioritize generation (frees resources faster)
+        return True
+
+    def _num_running(self) -> int:
+        """Return total number of running sequences."""
+        return len(self.running_reasoning) + len(self.running_generation)
+
     def schedule(self) -> tuple[list[Sequence], RunPhase]:
+        # Update block reservation based on recent statistics
+        self.block_manager.update_reservation(
+            self.stats.recent_avg_generation_length, 
+            self._num_running()
+        )
+        
+        # Proactive preemption: if memory is getting tight and waiting queue is backing up,
+        # preempt some sequences now to avoid thrashing later
+        if self._should_proactively_preempt():
+            self._proactive_preempt(count=2)
+        
         # prefill
         scheduled_seqs = []
         num_seqs = 0
@@ -90,7 +191,8 @@ class Scheduler:
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens:
                 block_reason = "tokens"
                 break
-            if not self.block_manager.can_allocate(seq):
+            # Use available_blocks to respect reservation for decode headroom
+            if not self.block_manager.can_allocate(seq) or self.block_manager.available_blocks < seq.num_blocks:
                 block_reason = "blocks"
                 break
 
@@ -129,9 +231,54 @@ class Scheduler:
             self._log(batch_phase.name, len(scheduled_seqs), block_reason)
             return scheduled_seqs, batch_phase
 
-        # prioritize generation over reasoning, since it frees up resources
-        # TODO: add heuristic to decide which to prioritize. E.g. prioritize generation if generation batch size is larger than B.
-        # generation
+        # Decide whether to prioritize generation or reasoning based on batch sizes
+        prioritize_generation = self._should_prioritize_generation()
+        
+        if prioritize_generation:
+            # Try generation first
+            scheduled_seqs = self._schedule_decode_generation(num_seqs)
+            if scheduled_seqs:
+                # Check minimum batch size - if too small and reasoning has more, try reasoning instead
+                if len(scheduled_seqs) < self.min_decode_batch_size and \
+                   len(self.running_reasoning) >= self.min_decode_batch_size:
+                    # Put generation sequences back
+                    self.running_generation.extendleft(reversed(scheduled_seqs))
+                    scheduled_seqs = []
+                else:
+                    self.running_generation.extendleft(reversed(scheduled_seqs))
+                    self._log("DECODE", len(scheduled_seqs), None)
+                    return scheduled_seqs, RunPhase.DECODE
+            
+            # Try reasoning if generation didn't produce a batch
+            if not scheduled_seqs:
+                scheduled_seqs = self._schedule_decode_reasoning(num_seqs)
+                if scheduled_seqs:
+                    self.running_reasoning.extendleft(reversed(scheduled_seqs))
+                    self._log("DECODE_MTP", len(scheduled_seqs), None)
+                    return scheduled_seqs, RunPhase.DECODE_MTP
+        else:
+            # Prioritize reasoning first (generation batch would be too small)
+            scheduled_seqs = self._schedule_decode_reasoning(num_seqs)
+            if scheduled_seqs:
+                self.running_reasoning.extendleft(reversed(scheduled_seqs))
+                self._log("DECODE_MTP", len(scheduled_seqs), None)
+                return scheduled_seqs, RunPhase.DECODE_MTP
+            
+            # Fall back to generation if reasoning didn't work
+            scheduled_seqs = self._schedule_decode_generation(num_seqs)
+            if scheduled_seqs:
+                self.running_generation.extendleft(reversed(scheduled_seqs))
+                self._log("DECODE", len(scheduled_seqs), None)
+                return scheduled_seqs, RunPhase.DECODE
+
+        # If we get here, all running sequences were preempted and are now in waiting.
+        # Recursively schedule to pick them up via prefill.
+        assert self.waiting, "No sequences to schedule but queues are empty"
+        return self.schedule()
+
+    def _schedule_decode_generation(self, num_seqs: int) -> list[Sequence]:
+        """Schedule generation (NTP) decode batch."""
+        scheduled_seqs = []
         while self.running_generation and num_seqs < self.max_num_seqs:
             seq = self.running_generation.popleft()
             while not self.block_manager.can_append(seq):
@@ -144,12 +291,11 @@ class Scheduler:
                 num_seqs += 1
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        if scheduled_seqs:
-            self.running_generation.extendleft(reversed(scheduled_seqs))
-            self._log("DECODE", len(scheduled_seqs), None)
-            return scheduled_seqs, RunPhase.DECODE
+        return scheduled_seqs
 
-        # reasoning
+    def _schedule_decode_reasoning(self, num_seqs: int) -> list[Sequence]:
+        """Schedule reasoning (MTP) decode batch."""
+        scheduled_seqs = []
         while self.running_reasoning and num_seqs < self.max_num_seqs:
             seq = self.running_reasoning.popleft()
             while not self.block_manager.can_append(seq):
@@ -162,15 +308,7 @@ class Scheduler:
                 num_seqs += 1
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        if scheduled_seqs:
-            self.running_reasoning.extendleft(reversed(scheduled_seqs))
-            self._log("DECODE_MTP", len(scheduled_seqs), None)
-            return scheduled_seqs, RunPhase.DECODE_MTP
-
-        # If we get here, all running sequences were preempted and are now in waiting.
-        # Recursively schedule to pick them up via prefill.
-        assert self.waiting, "No sequences to schedule but queues are empty"
-        return self.schedule()
+        return scheduled_seqs
     
     def _log(self, phase: str, batch_size: int, block_reason: str | None):
         if not self.debug:
@@ -196,6 +334,7 @@ class Scheduler:
                 is_limit = seq.num_completion_tokens == seq.max_tokens
             if (not seq.ignore_eos and token_id == self.eos) or is_limit:
                 seq.status = SequenceStatus.FINISHED
+                self.stats.record_completion(seq)  # Record completion for adaptive scheduling
                 self.block_manager.deallocate(seq)
                 self.running_generation.remove(seq)
 
@@ -210,6 +349,7 @@ class Scheduler:
                 seq.append_token(token_ids[0])  # Append as regular answer token
                 if seq.num_completion_tokens == seq.max_tokens or token_ids[0] == self.eos:
                     seq.status = SequenceStatus.FINISHED
+                    self.stats.record_completion(seq)  # Record completion for adaptive scheduling
                     self.block_manager.deallocate(seq)
                     self.running_reasoning.remove(seq)
                 else:
@@ -228,6 +368,7 @@ class Scheduler:
 
             if seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
+                self.stats.record_completion(seq)  # Record completion for adaptive scheduling
                 self.block_manager.deallocate(seq)
                 self.running_reasoning.remove(seq)
             elif token_ids[0] == self.eot:
