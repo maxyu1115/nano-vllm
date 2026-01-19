@@ -689,11 +689,21 @@ class ModelRunner:
             ignore_mtp_tokens = torch.zeros_like(mtp_tokens, dtype=torch.bool).cuda(non_blocking=True)
             if self.adapt_decode_type == "threshold":
                 ntp_thresholds = torch.tensor(
-                    [seq.soft_mtp_params.adaptive_threshold[0] if seq.soft_mtp_params.adaptive_threshold is not None else 0 for seq in seqs],
+                    [
+                        seq.soft_mtp_params.adaptive_threshold[0]
+                            if (seq.soft_mtp_params is not None and seq.soft_mtp_params.adaptive_threshold is not None)
+                            else 0
+                        for seq in seqs
+                    ],
                     dtype=torch.float32,
                 ).cuda(non_blocking=True)
                 mtp_thresholds = torch.tensor(
-                    [seq.soft_mtp_params.adaptive_threshold[1] if seq.soft_mtp_params.adaptive_threshold is not None else 0 for seq in seqs],
+                    [
+                        seq.soft_mtp_params.adaptive_threshold[1]
+                            if (seq.soft_mtp_params is not None and seq.soft_mtp_params.adaptive_threshold is not None)
+                            else 0
+                        for seq in seqs
+                    ],
                     dtype=torch.float32,
                 ).cuda(non_blocking=True)
                 ignore_mtp_tokens = self.adapt_decode_policy(ntp_logits, mtp_logits, ntp_thresholds, mtp_thresholds)
