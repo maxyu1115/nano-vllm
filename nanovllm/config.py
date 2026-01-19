@@ -23,6 +23,8 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
+    debug: bool = False
+
     soft_mtp_adaptive_decoding_policy: Literal["threshold", "none"] = "none"
 
     def __post_init__(self):

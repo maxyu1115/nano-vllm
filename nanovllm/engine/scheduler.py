@@ -1,9 +1,23 @@
 from collections import deque
 from enum import Enum, auto
+import time
+import os
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+
+
+# Simple CSV logger for scheduler debugging
+_metrics_file = None
+def _log_metrics(msg: str):
+    global _metrics_file
+    if _metrics_file is None:
+        fname = f"scheduler_metrics_{os.getpid()}_{time.strftime('%H%M%S')}.csv"
+        _metrics_file = open(fname, "w")
+        _metrics_file.write("time,event,batch,wait,reason,gen,free_blk,preempts\n")
+    _metrics_file.write(msg + "\n")
+    _metrics_file.flush()
 
 
 class RunPhase(Enum):
@@ -40,6 +54,8 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running_reasoning: deque[Sequence] = deque()
         self.running_generation: deque[Sequence] = deque()
+        self.debug = config.debug
+        self._preempts = 0  # total preemption count
 
     def is_finished(self):
         return not self.waiting and not self.running_reasoning and not self.running_generation
@@ -67,10 +83,15 @@ class Scheduler:
         num_batched_tokens = 0
         # For soft-MTP restored sequences, track the phase of the batch to avoid mixing
         batch_phase: RunPhase | None = None
+        block_reason = None
 
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+            if num_batched_tokens + len(seq) > self.max_num_batched_tokens:
+                block_reason = "tokens"
+                break
+            if not self.block_manager.can_allocate(seq):
+                block_reason = "blocks"
                 break
 
             # Determine the prefill phase for this sequence
@@ -87,6 +108,7 @@ class Scheduler:
             if batch_phase is None:
                 batch_phase = seq_phase
             elif batch_phase != seq_phase:
+                block_reason = "phase"
                 break
 
             num_seqs += 1
@@ -104,6 +126,7 @@ class Scheduler:
                 self.running_generation.append(seq)
             scheduled_seqs.append(seq)
         if scheduled_seqs:
+            self._log(batch_phase.name, len(scheduled_seqs), block_reason)
             return scheduled_seqs, batch_phase
 
         # prioritize generation over reasoning, since it frees up resources
@@ -123,6 +146,7 @@ class Scheduler:
                 scheduled_seqs.append(seq)
         if scheduled_seqs:
             self.running_generation.extendleft(reversed(scheduled_seqs))
+            self._log("DECODE", len(scheduled_seqs), None)
             return scheduled_seqs, RunPhase.DECODE
 
         # reasoning
@@ -140,15 +164,25 @@ class Scheduler:
                 scheduled_seqs.append(seq)
         if scheduled_seqs:
             self.running_reasoning.extendleft(reversed(scheduled_seqs))
+            self._log("DECODE_MTP", len(scheduled_seqs), None)
             return scheduled_seqs, RunPhase.DECODE_MTP
 
         # If we get here, all running sequences were preempted and are now in waiting.
         # Recursively schedule to pick them up via prefill.
         assert self.waiting, "No sequences to schedule but queues are empty"
         return self.schedule()
+    
+    def _log(self, phase: str, batch_size: int, block_reason: str | None):
+        if not self.debug:
+            return
+        t = time.strftime("%H:%M:%S")
+        wait = len(self.waiting)
+        gen = len(self.running_generation) + len(self.running_reasoning)
+        free = self.block_manager.free_blocks
+        _log_metrics(f"{t},{phase},{batch_size},{wait},{block_reason or ''},{gen},{free},{self._preempts}")
 
     def preempt(self, seq: Sequence):
-        # pause this sequence to free up resources
+        self._preempts += 1
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)

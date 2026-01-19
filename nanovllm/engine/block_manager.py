@@ -37,6 +37,11 @@ class BlockManager:
         self.soft_mtp_enabled = max_soft_mtp_tokens > 1
         assert max_soft_mtp_tokens <= 2, "Current Soft MTP prefill_allocate only supports 2 tokens"
 
+    @property
+    def free_blocks(self) -> int:
+        """Number of free blocks available."""
+        return len(self.free_block_ids)
+
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
