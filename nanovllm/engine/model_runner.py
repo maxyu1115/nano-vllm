@@ -233,7 +233,10 @@ class ModelRunner:
             # MTP module positions are off by 1, since the ntp token isn't added to seq yet
             mtp_positions.append(len(seq))
             mtp_context_lens.append(len(seq) + 1)
-            mtp_slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens)
+            if seq.last_block_num_tokens == self.block_size:
+                mtp_slot_mapping.append(seq.block_table[-1] * self.block_size)
+            else:
+                mtp_slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens)
 
         mtp_positions = torch.tensor(mtp_positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         mtp_slot_mapping = torch.tensor(mtp_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
