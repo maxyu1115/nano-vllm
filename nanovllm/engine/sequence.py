@@ -106,15 +106,15 @@ class Sequence:
         assert len(token_ids) == 2
         assert not self.eot_from_mtp_module, "After reaching this state, we should not append more tokens"
 
+        if token_ids[-1] == END_OF_THINK_TOKEN_ID:
+            self.eot_from_mtp_module = True
+            token_ids = (token_ids[0], COT_PAD_TOKEN_ID) # override, EOT token will be added next step
+        self.next_input_cot_ids = token_ids
+
         if self.num_tokens % self.block_size == 0:
             self.uncompressed_token_ids_by_block.append(list(token_ids))
         else:
             self.uncompressed_token_ids_by_block[-1].extend(token_ids)
-
-        if token_ids[-1] == END_OF_THINK_TOKEN_ID:
-            self.eot_from_mtp_module = True
-            token_ids = (token_ids[0], COT_PAD_TOKEN_ID)
-        self.next_input_cot_ids = token_ids
 
         if token_ids[-1] == COT_PAD_TOKEN_ID:
             self.token_ids.append(token_ids[0])
@@ -130,15 +130,7 @@ class Sequence:
 
     def apply_eot_from_mtp_module(self):
         # Add the EOT token and increment num_tokens for the soft token from this step
-        self.token_ids.append(END_OF_THINK_TOKEN_ID)
-        # NOTE: since the EOT was already appended to uncompressed_token_ids_by_block on the previous step,
-        # we just append two COT_PAD_TOKEN_ID tokens
-        if self.num_tokens % self.block_size == 0:
-            self.uncompressed_token_ids_by_block.append([COT_PAD_TOKEN_ID, COT_PAD_TOKEN_ID])
-        else:
-            self.uncompressed_token_ids_by_block[-1].extend([COT_PAD_TOKEN_ID, COT_PAD_TOKEN_ID])
-        self.last_token = END_OF_THINK_TOKEN_ID
-        self.num_tokens += 1
+        self.append_token(END_OF_THINK_TOKEN_ID)
         self.eot_from_mtp_module = False
 
     def __getstate__(self):
