@@ -609,7 +609,7 @@ class ModelRunner:
     def run_model_mtp_prefill(self, seqs: list[Sequence], temperatures: torch.Tensor, mtp_temperatures: torch.Tensor) -> list[list[int]]:
         input_ids, positions = self.prepare_prefill(seqs)
         ntp_hidden_states = self.model.ntp_prefill(input_ids, positions)
-        mtp_hidden_states = self.model.mtp_prefill(input_ids, positions)
+        self.model.mtp_prefill(input_ids, positions)
         ntp_logits = self.model.compute_logits(ntp_hidden_states)
 
         # get the hidden states for the last token of each sequence
