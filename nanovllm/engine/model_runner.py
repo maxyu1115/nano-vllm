@@ -243,7 +243,7 @@ class ModelRunner:
             mtp_positions.append(pos)
             mtp_context_lens.append(pos + 1)
             # Compute slot mapping for this position
-            mtp_slot_mapping.append(self._compute_slot_mapping(seq, [pos])[0])
+            mtp_slot_mapping.append(self._compute_slot_mapping(seq, pos))
 
         mtp_positions = torch.tensor(mtp_positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         mtp_slot_mapping = torch.tensor(mtp_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -302,12 +302,10 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            if len(seq.block_table) != seq.num_blocks:
-                slot_mapping.append(seq.block_table[-2] * self.block_size + seq.last_block_num_tokens  - 1)
-            else:
-                slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+            pos = len(seq) - 1
+            positions.append(pos)
+            context_lens.append(pos + 1)
+            slot_mapping.append(self._compute_slot_mapping(seq, pos))
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -325,7 +323,6 @@ class ModelRunner:
     def prepare_soft_mtp_decode(self, seqs: list[Sequence]):
         mtp_input_ids = []
         positions = []
-        mtp_positions = []
         slot_mapping = []
         mtp_slot_mapping = []
         context_lens = []
@@ -334,21 +331,15 @@ class ModelRunner:
             # This is because the multiple input tokens are compressed into 1 token before fed into the transformer.
             assert len(seq.next_input_cot_ids) == self.max_soft_mtp_tokens
             mtp_input_ids.append(seq.next_input_cot_ids)
-            positions.append(len(seq) - 1)
-            mtp_positions.append(len(seq) - 1 + 1)
-            context_lens.append(len(seq))
-            if len(seq.block_table) != seq.num_blocks:
-                # this is the case when we allocated an additional block for the MTP module.
-                # Meaning the last tokens fall on the block boundary
-                slot_mapping.append(seq.block_table[-2] * self.block_size + seq.last_block_num_tokens  - 1)
-                mtp_slot_mapping.append(seq.block_table[-1] * self.block_size)
-            else:
-                slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-                mtp_slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens)
+            pos = len(seq) - 1
+            positions.append(pos)
+            context_lens.append(pos + 1)
+            slot_mapping.append(self._compute_slot_mapping(seq, pos))
+            mtp_slot_mapping.append(self._compute_slot_mapping(seq, pos + 1))
 
         mtp_input_ids = torch.tensor(mtp_input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        mtp_positions = torch.tensor(mtp_positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        mtp_positions = positions + 1
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         mtp_slot_mapping = torch.tensor(mtp_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -375,9 +366,9 @@ class ModelRunner:
         mtp_temperatures = torch.tensor(mtp_temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures, mtp_temperatures
 
-    def _compute_slot_mapping(self, seq: Sequence, positions: list[int]) -> list[int]:
+    def _compute_slot_mapping(self, seq: Sequence, p: int) -> list[int]:
         """Compute slot mapping for given positions in a sequence."""
-        return [seq.block_table[p // self.block_size] * self.block_size + p % self.block_size for p in positions]
+        return seq.block_table[p // self.block_size] * self.block_size + p % self.block_size
 
     def _set_prefill_context_for_section(
         self,
@@ -396,7 +387,7 @@ class ModelRunner:
 
         for seq, positions, ctx_len in zip(seqs, positions_per_seq, context_len_per_seq):
             all_positions.extend(positions)
-            slot_mapping.extend(self._compute_slot_mapping(seq, positions))
+            slot_mapping.extend([self._compute_slot_mapping(seq, p) for p in positions])
             seqlen_q = len(positions)
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + ctx_len)
@@ -487,52 +478,52 @@ class ModelRunner:
         all_prompt_tokens = [t for tokens in prompt_tokens_per_seq for t in tokens]
         prompt_ntp_hidden_states = None
         cu_seqlens_q = None
-        if all_prompt_tokens:
-            prompt_ctx_lens = [len(tokens) for tokens in prompt_tokens_per_seq]
-            positions_t, cu_seqlens_q = self._set_prefill_context_for_section(seqs, prompt_positions_per_seq, prompt_ctx_lens, DEFAULT_CONTEXT_KEY)
-            self._set_prefill_context_for_section(seqs, prompt_positions_per_seq, prompt_ctx_lens, MTP_MODULE_CONTEXT_KEY)
+        assert all_prompt_tokens, "Prompt tokens should not be empty"
+        prompt_ctx_lens = [len(tokens) for tokens in prompt_tokens_per_seq]
+        positions_t, cu_seqlens_q = self._set_prefill_context_for_section(seqs, prompt_positions_per_seq, prompt_ctx_lens, DEFAULT_CONTEXT_KEY)
+        self._set_prefill_context_for_section(seqs, prompt_positions_per_seq, prompt_ctx_lens, MTP_MODULE_CONTEXT_KEY)
 
-            input_ids = torch.tensor(all_prompt_tokens, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            prompt_ntp_hidden_states = self.model.ntp_prefill(input_ids, positions_t)
-            self.model.mtp_prefill(input_ids, positions_t)
-            reset_context()
+        input_ids = torch.tensor(all_prompt_tokens, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        prompt_ntp_hidden_states = self.model.ntp_prefill(input_ids, positions_t)
+        self.model.mtp_prefill(input_ids, positions_t)
+        reset_context()
 
         # Step 1.5: Initial MTP token at position prompt_len
         # In the normal path (PREFILL_MTP), after prompt prefill, mtp_decode writes a KV entry
         # at position prompt_len. This mirrors that behavior for the restore path.
         all_cot_multi = [m for multi in cot_multi_ids_per_seq for m in multi]
-        if all_cot_multi and prompt_ntp_hidden_states is not None:
-            last_prompt_hidden = self._extract_last_hidden_per_seq(prompt_ntp_hidden_states, cu_seqlens_q)
-            first_ntp_tokens = torch.tensor(
-                [cot_multi_ids_per_seq[i][0][0] for i in range(len(seqs))],
-                dtype=torch.int64, pin_memory=True
-            ).cuda(non_blocking=True)
-            prompt_lens = [seq.num_prompt_tokens for seq in seqs]
-            self._run_initial_mtp_decode(seqs, last_prompt_hidden, first_ntp_tokens, position_override=prompt_lens)
-            reset_context()
+        assert all_cot_multi and prompt_ntp_hidden_states is not None, "All cot multi and prompt ntp hidden states should not be empty"
+        last_prompt_hidden = self._extract_last_hidden_per_seq(prompt_ntp_hidden_states, cu_seqlens_q)
+        first_ntp_tokens = torch.tensor(
+            [cot_multi_ids_per_seq[i][0][0] for i in range(len(seqs))],
+            dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        prompt_lens = [seq.num_prompt_tokens for seq in seqs]
+        self._run_initial_mtp_decode(seqs, last_prompt_hidden, first_ntp_tokens, position_override=prompt_lens)
+        reset_context()
 
         # Step 2: Prefill CoT section
         cot_ntp_hidden_states = None
         cot_multi_input_embeds = None
-        if all_cot_multi:
-            prompt_lens = [seq.num_prompt_tokens for seq in seqs]
-            cot_ctx_lens = [prompt_lens[i] + len(cot_positions_per_seq[i]) for i in range(len(seqs))]
-            positions_t, _ = self._set_prefill_context_for_section(seqs, cot_positions_per_seq, cot_ctx_lens, DEFAULT_CONTEXT_KEY)
+        assert all_cot_multi, "All cot multi should not be empty"
+        prompt_lens = [seq.num_prompt_tokens for seq in seqs]
+        cot_ctx_lens = [prompt_lens[i] + len(cot_positions_per_seq[i]) for i in range(len(seqs))]
+        positions_t, _ = self._set_prefill_context_for_section(seqs, cot_positions_per_seq, cot_ctx_lens, DEFAULT_CONTEXT_KEY)
 
-            multi_input_ids = torch.tensor(all_cot_multi, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            cot_ntp_hidden_states, cot_multi_input_embeds = self.model.ntp_decode(multi_input_ids, positions_t)
-            reset_context()
+        multi_input_ids = torch.tensor(all_cot_multi, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cot_ntp_hidden_states, cot_multi_input_embeds = self.model.ntp_decode(multi_input_ids, positions_t)
+        reset_context()
 
-            # MTP prefill for CoT
-            mtp_positions_per_seq = [[p + 1 for p in positions] for positions in cot_positions_per_seq]
-            mtp_ctx_lens = [c + 1 for c in cot_ctx_lens]
-            mtp_positions_t, _ = self._set_prefill_context_for_section(seqs, mtp_positions_per_seq, mtp_ctx_lens, MTP_MODULE_CONTEXT_KEY)
+        # MTP prefill for CoT
+        mtp_positions_per_seq = [[p + 1 for p in positions] for positions in cot_positions_per_seq]
+        mtp_ctx_lens = [c + 1 for c in cot_ctx_lens]
+        mtp_positions_t, _ = self._set_prefill_context_for_section(seqs, mtp_positions_per_seq, mtp_ctx_lens, MTP_MODULE_CONTEXT_KEY)
 
-            all_ntp_output_ids = [m[0] for m in all_cot_multi]
-            ntp_output_ids = torch.tensor(all_ntp_output_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        all_ntp_output_ids = [m[0] for m in all_cot_multi]
+        ntp_output_ids = torch.tensor(all_ntp_output_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
 
-            self.model.mtp_decode(cot_multi_input_embeds, cot_ntp_hidden_states, ntp_output_ids, mtp_positions_t)
-            reset_context()
+        self.model.mtp_decode(cot_multi_input_embeds, cot_ntp_hidden_states, ntp_output_ids, mtp_positions_t)
+        reset_context()
 
         return cot_ntp_hidden_states, cot_multi_input_embeds
 
