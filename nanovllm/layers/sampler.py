@@ -7,7 +7,7 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
 
-    @torch.compile
+    # @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         # Ensure logits are in floating point for the softmax / sampling math.
         logits = logits.float()
@@ -32,6 +32,6 @@ class Sampler(nn.Module):
         sampled_tokens = noisy_probs.argmax(dim=-1)
 
         # Select between greedy and sampled tokens in a tensor-friendly way for torch.compile.
-        is_greedy = (temperatures < 1e-5)
+        is_greedy = (temperatures <= 1e-5)
         output_tokens = torch.where(is_greedy, greedy_tokens, sampled_tokens)
         return output_tokens

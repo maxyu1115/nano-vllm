@@ -4,7 +4,7 @@ from torch import nn
 
 
 class AdaptiveDecodingThresholdPolicy(nn.Module):
-    @torch.compile
+    # @torch.compile
     def forward(self, ntp_logits: torch.Tensor, mtp_logits: torch.Tensor, ntp_thresholds: torch.Tensor, mtp_thresholds: torch.Tensor) -> torch.Tensor:
         ntp_probs = F.softmax(ntp_logits, dim=-1)
         mtp_probs = F.softmax(mtp_logits, dim=-1)
