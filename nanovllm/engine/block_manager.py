@@ -158,22 +158,24 @@ class BlockManager:
 
     def may_append(self, seq: Sequence):
         # NOTE: with recent scheduling changes, may_append may be called but the schedule aborted.
-        # So importantly, max_append needs to be idempotent!
+        # So importantly, may_append needs to be idempotent!
         block_table = seq.block_table
-        last_block = self.blocks[block_table[-1]]
 
         if len(seq) % self.block_size == 0:
-            if last_block.hash != INVALID_BLOCK_HASH:
+            # The block that just completed is at this index (not necessarily block_table[-1]
+            # if a new block was already allocated for MTP in a previous call)
+            completed_block_idx = len(seq) // self.block_size - 1
+            completed_block = self.blocks[block_table[completed_block_idx]]
+            if completed_block.hash != INVALID_BLOCK_HASH:
                 return
-
             if self.soft_mtp_enabled:
-                token_ids = seq.uncompressed_block(seq.num_blocks-1)
+                token_ids = seq.uncompressed_block(completed_block_idx)
             else:
-                token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else INVALID_BLOCK_HASH
+                token_ids = seq.block(completed_block_idx)
+            prefix = self.blocks[block_table[completed_block_idx - 1]].hash if completed_block_idx > 0 else INVALID_BLOCK_HASH
             h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
+            completed_block.update(h, token_ids)
+            self.hash_to_block_id[h] = completed_block.block_id
 
         # we need to allocate a new block if the last MTP modules will need the next block
         if (len(seq) + self.max_soft_mtp_tokens - 1) % self.block_size == 1:
@@ -182,7 +184,8 @@ class BlockManager:
             if len(block_table) > required_block_idx:
                 return
 
-            assert last_block.hash != INVALID_BLOCK_HASH
+            # The block before the one we're about to allocate should be finalized
+            assert self.blocks[block_table[required_block_idx - 1]].hash != INVALID_BLOCK_HASH
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
