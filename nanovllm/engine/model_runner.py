@@ -219,24 +219,31 @@ class ModelRunner:
             )
         return input_ids, positions
 
-    def prepare_soft_mtp_prefill_decode(self, seqs: list[Sequence]):
+    def prepare_soft_mtp_prefill_decode(self, seqs: list[Sequence], position_override: list[int] | None = None):
+        """Prepare context for MTP decode at a single position per sequence.
+        
+        Args:
+            seqs: Sequences to process
+            position_override: Optional list of positions to use instead of len(seq).
+                Useful for restore path where seq already contains CoT tokens.
+        """
         mtp_positions = []
         mtp_slot_mapping = []
         mtp_context_lens = []
         is_warmup = False
-        for seq in seqs:
+        for i, seq in enumerate(seqs):
             if not seq.block_table:    # warmup
                 is_warmup = True
                 mtp_positions.append(0)
                 mtp_slot_mapping.append(0) # append a dummy values for warmup
                 continue
+            # Use override if provided, otherwise use len(seq)
             # MTP module positions are off by 1, since the ntp token isn't added to seq yet
-            mtp_positions.append(len(seq))
-            mtp_context_lens.append(len(seq) + 1)
-            if seq.last_block_num_tokens == self.block_size:
-                mtp_slot_mapping.append(seq.block_table[-1] * self.block_size)
-            else:
-                mtp_slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens)
+            pos = position_override[i] if position_override is not None else len(seq)
+            mtp_positions.append(pos)
+            mtp_context_lens.append(pos + 1)
+            # Compute slot mapping for this position
+            mtp_slot_mapping.append(self._compute_slot_mapping(seq, [pos])[0])
 
         mtp_positions = torch.tensor(mtp_positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         mtp_slot_mapping = torch.tensor(mtp_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -259,6 +266,34 @@ class ModelRunner:
             block_tables = self.prepare_block_tables(seqs)
             set_context(key=MTP_MODULE_CONTEXT_KEY, is_prefill=False, slot_mapping=mtp_slot_mapping, context_lens=mtp_context_lens, block_tables=block_tables)
         return mtp_positions
+
+    def _extract_last_hidden_per_seq(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+    ) -> torch.Tensor:
+        """Extract the last hidden state for each sequence from batched prefill output."""
+        last_indices = cu_seqlens_q[1:] - 1
+        return hidden_states[last_indices].contiguous()
+
+    def _run_initial_mtp_decode(
+        self,
+        seqs: list[Sequence],
+        last_ntp_hidden: torch.Tensor,
+        ntp_tokens: torch.Tensor,
+        position_override: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Run initial MTP decode at position prompt_len with zeros for multi_input_embeds."""
+        mtp_positions = self.prepare_soft_mtp_prefill_decode(seqs, position_override)
+        # In this special case of the first MTP token, we don't have a second input token.
+        # Technically we should pass in COT_PAD_TOKEN_ID, and then mask it out with 0.0, so
+        # instead we just pass in zeros. (And note that the first tokens in multi_input_embeds is not used.)
+        multi_input_embeds = torch.zeros(
+            len(seqs), self.max_soft_mtp_tokens, self.model.config.hidden_size,
+            dtype=torch.bfloat16, device="cuda"
+        )
+        mtp_hidden_states = self.model.mtp_decode(multi_input_embeds, last_ntp_hidden, ntp_tokens, mtp_positions)
+        return mtp_hidden_states
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
@@ -450,18 +485,33 @@ class ModelRunner:
         """
         # Step 1: Prefill prompt section (NTP + MTP)
         all_prompt_tokens = [t for tokens in prompt_tokens_per_seq for t in tokens]
+        prompt_ntp_hidden_states = None
+        cu_seqlens_q = None
         if all_prompt_tokens:
             prompt_ctx_lens = [len(tokens) for tokens in prompt_tokens_per_seq]
-            positions_t, _ = self._set_prefill_context_for_section(seqs, prompt_positions_per_seq, prompt_ctx_lens, DEFAULT_CONTEXT_KEY)
+            positions_t, cu_seqlens_q = self._set_prefill_context_for_section(seqs, prompt_positions_per_seq, prompt_ctx_lens, DEFAULT_CONTEXT_KEY)
             self._set_prefill_context_for_section(seqs, prompt_positions_per_seq, prompt_ctx_lens, MTP_MODULE_CONTEXT_KEY)
 
             input_ids = torch.tensor(all_prompt_tokens, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            self.model.ntp_prefill(input_ids, positions_t)
+            prompt_ntp_hidden_states = self.model.ntp_prefill(input_ids, positions_t)
             self.model.mtp_prefill(input_ids, positions_t)
             reset_context()
 
-        # Step 2: Prefill CoT section
+        # Step 1.5: Initial MTP token at position prompt_len
+        # In the normal path (PREFILL_MTP), after prompt prefill, mtp_decode writes a KV entry
+        # at position prompt_len. This mirrors that behavior for the restore path.
         all_cot_multi = [m for multi in cot_multi_ids_per_seq for m in multi]
+        if all_cot_multi and prompt_ntp_hidden_states is not None:
+            last_prompt_hidden = self._extract_last_hidden_per_seq(prompt_ntp_hidden_states, cu_seqlens_q)
+            first_ntp_tokens = torch.tensor(
+                [cot_multi_ids_per_seq[i][0][0] for i in range(len(seqs))],
+                dtype=torch.int64, pin_memory=True
+            ).cuda(non_blocking=True)
+            prompt_lens = [seq.num_prompt_tokens for seq in seqs]
+            self._run_initial_mtp_decode(seqs, last_prompt_hidden, first_ntp_tokens, position_override=prompt_lens)
+            reset_context()
+
+        # Step 2: Prefill CoT section
         cot_ntp_hidden_states = None
         cot_multi_input_embeds = None
         if all_cot_multi:
@@ -615,22 +665,15 @@ class ModelRunner:
         self.model.mtp_prefill(input_ids, positions)
         ntp_logits = self.model.compute_logits(ntp_hidden_states)
 
-        # get the hidden states for the last token of each sequence
-        # TODO: this is technically redundant, since compute_logits already does this select by index. But no good way to extract that output
+        # Extract last hidden state per sequence for MTP decode
         context = get_context(DEFAULT_CONTEXT_KEY)
-        last_indices = context.cu_seqlens_q[1:] - 1
-        ntp_hidden_states = ntp_hidden_states[last_indices].contiguous()
+        last_ntp_hidden = self._extract_last_hidden_per_seq(ntp_hidden_states, context.cu_seqlens_q)
 
         # TODO: sync across all ranks
         ntp_tokens = self.sampler(ntp_logits, temperatures)
 
         reset_context()
-        mtp_positions = self.prepare_soft_mtp_prefill_decode(seqs)
-        # In this special case of the first MTP token, we don't have a second input token.
-        # Technically we should pass in COT_PAD_TOKEN_ID, and then mask it out with 0.0, so
-        # instead we just pass in zeros. (And note that the first tokens in multi_input_embeds is not used.)
-        multi_input_embeds = torch.zeros(ntp_tokens.size(0), self.max_soft_mtp_tokens, self.model.config.hidden_size, dtype=torch.bfloat16, device=ntp_tokens.device)
-        mtp_hidden_states = self.model.mtp_decode(multi_input_embeds, ntp_hidden_states, ntp_tokens, mtp_positions)
+        mtp_hidden_states = self._run_initial_mtp_decode(seqs, last_ntp_hidden, ntp_tokens)
         mtp_logits = self.model.compute_logits(mtp_hidden_states, MTP_MODULE_CONTEXT_KEY)
 
         if self.rank == 0:
