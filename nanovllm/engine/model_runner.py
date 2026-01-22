@@ -269,7 +269,10 @@ class ModelRunner:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            if len(seq.block_table) != seq.num_blocks:
+                slot_mapping.append(seq.block_table[-2] * self.block_size + seq.last_block_num_tokens  - 1)
+            else:
+                slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
