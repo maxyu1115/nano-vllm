@@ -340,23 +340,6 @@ class Scheduler:
 
     def postprocess_reasoning(self, seqs: list[Sequence], mtp_ids: list[list[int]]):
         for seq, token_ids in zip(seqs, mtp_ids):
-            # Special case: restored sequence that already emitted EOT but has no answer tokens yet.
-            # This was handled via reasoning restore path, so we get [ntp, mtp] tokens,
-            # but we should only use the NTP token as the first answer token and transition.
-            # NOTE: During normal decoding, this will never be triggered since we would go into
-            # process_ntp instead.
-            if seq.last_token == self.eot:
-                seq.append_token(token_ids[0])  # Append as regular answer token
-                if seq.num_completion_tokens == seq.max_tokens or token_ids[0] == self.eos:
-                    seq.status = SequenceStatus.FINISHED
-                    self.stats.record_completion(seq)  # Record completion for adaptive scheduling
-                    self.block_manager.deallocate(seq)
-                    self.running_reasoning.remove(seq)
-                else:
-                    self.running_reasoning.remove(seq)
-                    self.running_generation.append(seq)
-                continue
-
             if seq.eot_from_mtp_module:
                 seq.apply_eot_from_mtp_module()
                 token_ids = (self.eot, -1) # swap out token_ids, so we transition to answer phase
