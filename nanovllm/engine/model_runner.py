@@ -463,6 +463,7 @@ class ModelRunner:
         prompt_positions_per_seq: list[list[int]],
         cot_multi_ids_per_seq: list[list[list[int]]],
         cot_positions_per_seq: list[list[int]],
+        ntp_only: bool = False, # if True, only prefill the NTP module
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Restore KV cache for prompt and CoT sections.
         
@@ -476,8 +477,6 @@ class ModelRunner:
         """
         # Step 1: Prefill prompt section (NTP + MTP)
         all_prompt_tokens = [t for tokens in prompt_tokens_per_seq for t in tokens]
-        prompt_ntp_hidden_states = None
-        cu_seqlens_q = None
         assert all_prompt_tokens, "Prompt tokens should not be empty"
         prompt_ctx_lens = [len(tokens) for tokens in prompt_tokens_per_seq]
         positions_t, cu_seqlens_q = self._set_prefill_context_for_section(seqs, prompt_positions_per_seq, prompt_ctx_lens, DEFAULT_CONTEXT_KEY)
@@ -485,26 +484,14 @@ class ModelRunner:
 
         input_ids = torch.tensor(all_prompt_tokens, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         prompt_ntp_hidden_states = self.model.ntp_prefill(input_ids, positions_t)
-        self.model.mtp_prefill(input_ids, positions_t)
+        if not ntp_only:
+            self.model.mtp_prefill(input_ids, positions_t)
         reset_context()
 
-        # Step 1.5: Initial MTP token at position prompt_len
-        # In the normal path (PREFILL_MTP), after prompt prefill, mtp_decode writes a KV entry
-        # at position prompt_len. This mirrors that behavior for the restore path.
-        all_cot_multi = [m for multi in cot_multi_ids_per_seq for m in multi]
-        assert all_cot_multi and prompt_ntp_hidden_states is not None, "All cot multi and prompt ntp hidden states should not be empty"
-        last_prompt_hidden = self._extract_last_hidden_per_seq(prompt_ntp_hidden_states, cu_seqlens_q)
-        first_ntp_tokens = torch.tensor(
-            [cot_multi_ids_per_seq[i][0][0] for i in range(len(seqs))],
-            dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
-        prompt_lens = [seq.num_prompt_tokens for seq in seqs]
-        self._run_initial_mtp_decode(seqs, last_prompt_hidden, first_ntp_tokens, position_override=prompt_lens)
-        reset_context()
-
-        # Step 2: Prefill CoT section
+        # Step 2: Prefill NTP CoT section
         cot_ntp_hidden_states = None
         cot_multi_input_embeds = None
+        all_cot_multi = [m for multi in cot_multi_ids_per_seq for m in multi]
         assert all_cot_multi, "All cot multi should not be empty"
         prompt_lens = [seq.num_prompt_tokens for seq in seqs]
         cot_ctx_lens = [prompt_lens[i] + len(cot_positions_per_seq[i]) for i in range(len(seqs))]
@@ -513,16 +500,46 @@ class ModelRunner:
         multi_input_ids = torch.tensor(all_cot_multi, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cot_ntp_hidden_states, cot_multi_input_embeds = self.model.ntp_decode(multi_input_ids, positions_t)
         reset_context()
+        if ntp_only:
+            return cot_ntp_hidden_states, cot_multi_input_embeds
 
-        # MTP prefill for CoT
-        mtp_positions_per_seq = [[p + 1 for p in positions] for positions in cot_positions_per_seq]
-        mtp_ctx_lens = [c + 1 for c in cot_ctx_lens]
-        mtp_positions_t, _ = self._set_prefill_context_for_section(seqs, mtp_positions_per_seq, mtp_ctx_lens, MTP_MODULE_CONTEXT_KEY)
+        # Step 3: MTP prefill for CoT
+        # Combined MTP prefill for positions prompt_len through prompt_len+num_cot-1
+        # This combines the old Step 1.5 and Step 2 MTP into a single prefill call.
+        # Position prompt_len+i where i=0..num_cot-1:
+        #   i == 0: zeros embeds, last_prompt_hidden, ntp_0
+        #   i > 0:  cot_embeds[i-1], cot_hidden[i-1], ntp_i
+        last_prompt_hidden = self._extract_last_hidden_per_seq(prompt_ntp_hidden_states, cu_seqlens_q)
+        hidden_dim = self.model.config.hidden_size
 
+        all_combined_hidden = []
+        all_combined_embeds = []
         all_ntp_output_ids = [m[0] for m in all_cot_multi]
+
+        offset = 0
+        for seq_idx, cot_multi in enumerate(cot_multi_ids_per_seq):
+            num_cot = len(cot_multi)
+
+            # Position prompt_len (i=0): zeros embeds, prompt_hidden, ntp_0
+            all_combined_hidden.append(last_prompt_hidden[seq_idx])
+            all_combined_embeds.append(torch.zeros(
+                self.max_soft_mtp_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda"
+            ))
+
+            # Positions prompt_len+1 through prompt_len+num_cot-1 (i=1..num_cot-1)
+            for i in range(1, num_cot):
+                all_combined_hidden.append(cot_ntp_hidden_states[offset + i - 1])
+                all_combined_embeds.append(cot_multi_input_embeds[offset + i - 1])
+
+            offset += num_cot
+
+        combined_hidden = torch.stack(all_combined_hidden)
+        combined_embeds = torch.stack(all_combined_embeds)
         ntp_output_ids = torch.tensor(all_ntp_output_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
 
-        self.model.mtp_decode(cot_multi_input_embeds, cot_ntp_hidden_states, ntp_output_ids, mtp_positions_t)
+        mtp_positions_t, _ = self._set_prefill_context_for_section(seqs, cot_positions_per_seq, cot_ctx_lens, MTP_MODULE_CONTEXT_KEY)
+
+        self.model.mtp_decode(combined_embeds, combined_hidden, ntp_output_ids, mtp_positions_t)
         reset_context()
 
         return cot_ntp_hidden_states, cot_multi_input_embeds
@@ -585,7 +602,7 @@ class ModelRunner:
         """
         # Extract and restore prompt + CoT
         prompt_tokens, prompt_positions, cot_multi_ids, cot_positions = self._extract_restore_data(seqs)
-        self._restore_prompt_and_cot(seqs, prompt_tokens, prompt_positions, cot_multi_ids, cot_positions)
+        self._restore_prompt_and_cot(seqs, prompt_tokens, prompt_positions, cot_multi_ids, cot_positions, ntp_only=True)
 
         # Extract answer data
         ans_tokens_per_seq = []
