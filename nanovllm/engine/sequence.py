@@ -15,6 +15,12 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
+class SequencePhase(Enum):
+    """Tracks whether the sequence is in reasoning (CoT) or answer phase."""
+    REASONING = auto()  # Generating tokens after BOT, before EOT
+    ANSWER = auto()     # Generating tokens after EOT
+
+
 class Sequence:
     block_size = 256
     counter = count()
@@ -24,7 +30,7 @@ class Sequence:
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.uncompressed_token_ids_by_block: list[list[int]] = [
-            copy(token_ids[i:i+self.block_size]) 
+            copy(token_ids[i:i+self.block_size])
             for i in range(0, len(token_ids), self.block_size)
         ]
         self.next_input_cot_ids: tuple[int, ...] = ()
@@ -39,6 +45,12 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.soft_mtp_params: SoftMTPSamplingParams = sampling_params.soft_mtp_params
+        # Separate cot/ans token limits
+        self.cot_max_tokens = sampling_params.cot_max_tokens
+        self.ans_max_tokens = sampling_params.ans_max_tokens
+        # Phase tracking for reasoning vs answer tokens
+        # Start in REASONING phase since prompts end with BOT
+        self.phase = SequencePhase.REASONING
 
         # When the MTP module generates the EOT token, it will set this flag to True
         # Since we still need to process the token from the NTP module, (and soft embed it with COT_PAD)
@@ -89,13 +101,22 @@ class Sequence:
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def append_token(self, token_id: int):
+        # Handle phase transition: EOT token triggers transition to answer phase
+        # EOT is counted as an answer token, so transition happens before counting
+        if token_id == END_OF_THINK_TOKEN_ID:
+            self.phase = SequencePhase.ANSWER
+
         if self.num_tokens % self.block_size == 0:
             self.uncompressed_token_ids_by_block.append([token_id])
         else:
             self.uncompressed_token_ids_by_block[-1].append(token_id)
         self.token_ids.append(token_id)
         self.last_token = token_id
-        self.num_ans_tokens += 1
+        # Track tokens based on current phase
+        if self.phase == SequencePhase.REASONING:
+            self.num_cot_tokens += 1
+        else:
+            self.num_ans_tokens += 1
         self.num_tokens += 1
 
     def uncompressed_block(self, i):
@@ -157,6 +178,9 @@ class Sequence:
             'max_tokens': self.max_tokens,
             'ignore_eos': self.ignore_eos,
             'soft_mtp_params': self.soft_mtp_params,
+            'cot_max_tokens': self.cot_max_tokens,
+            'ans_max_tokens': self.ans_max_tokens,
+            'phase': self.phase,
             'eot_from_mtp_module': self.eot_from_mtp_module,
         }
 
@@ -180,4 +204,7 @@ class Sequence:
         self.max_tokens = state['max_tokens']
         self.ignore_eos = state['ignore_eos']
         self.soft_mtp_params = state['soft_mtp_params']
+        self.cot_max_tokens = state['cot_max_tokens']
+        self.ans_max_tokens = state['ans_max_tokens']
+        self.phase = state['phase']
         self.eot_from_mtp_module = state['eot_from_mtp_module']

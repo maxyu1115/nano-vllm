@@ -55,7 +55,7 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-            if self.soft_mtp_enabled and prompt[-1] != self.bot_token_id:
+            if prompt[-1] != self.bot_token_id:
                 prompt.append(self.bot_token_id)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)

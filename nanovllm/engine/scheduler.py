@@ -5,7 +5,7 @@ import time
 import os
 
 from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence, SequenceStatus
+from nanovllm.engine.sequence import Sequence, SequenceStatus, SequencePhase
 from nanovllm.engine.block_manager import BlockManager
 
 
@@ -327,11 +327,20 @@ class Scheduler:
 
     def postprocess_ntp(self, seqs: list[Sequence], token_ids: list[int]):
         for seq, token_id in zip(seqs, token_ids):
+            # For normal LLMs in reasoning phase, check if cot_max_tokens is reached
+            if seq.phase == SequencePhase.REASONING and seq.cot_max_tokens is not None:
+                if seq.num_cot_tokens == seq.cot_max_tokens:
+                    # Force transition to answer by overriding with EOT token
+                    token_id = self.eot
+
             seq.append_token(token_id)
-            if seq.soft_mtp_params is not None and seq.soft_mtp_params.ans_max_tokens is not None:
-                is_limit = seq.num_ans_tokens == seq.soft_mtp_params.ans_max_tokens
+
+            # Determine if we've hit the token limit
+            if seq.ans_max_tokens is not None:
+                is_limit = seq.num_ans_tokens == seq.ans_max_tokens
             else:
                 is_limit = seq.num_completion_tokens == seq.max_tokens
+
             if (not seq.ignore_eos and token_id == self.eos) or is_limit:
                 seq.status = SequenceStatus.FINISHED
                 self.stats.record_completion(seq)  # Record completion for adaptive scheduling
@@ -344,8 +353,7 @@ class Scheduler:
                 seq.apply_eot_from_mtp_module()
                 token_ids = (self.eot, -1) # swap out token_ids, so we transition to answer phase
             else:
-                if (seq.soft_mtp_params is not None and seq.soft_mtp_params.cot_max_tokens is not None) \
-                    and seq.num_cot_tokens == seq.soft_mtp_params.cot_max_tokens:
+                if seq.cot_max_tokens is not None and seq.num_cot_tokens == seq.cot_max_tokens:
                     # force transition to answer by overriding with EOT token
                     token_ids = (self.eot, token_ids[1])
                 seq.append_soft_mtp_tokens(token_ids)
@@ -357,7 +365,8 @@ class Scheduler:
                 self.running_reasoning.remove(seq)
             elif token_ids[0] == self.eot:
                 # NTP predicted EOT - immediate transition to generation
-                # (Don't check MTP token here; if only MTP predicted EOT, 
+                # (Don't check MTP token here; if only MTP predicted EOT,
                 # eot_from_mtp_module flag handles the delayed transition)
+                # Phase transition is handled inside append_soft_mtp_tokens/append_token
                 self.running_reasoning.remove(seq)
                 self.running_generation.append(seq)
