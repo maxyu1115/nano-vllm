@@ -38,6 +38,7 @@ class ModelRunner:
         sequence.END_OF_THINK_TOKEN_ID = config.eot
         self.adapt_decode_type: Literal["threshold", "none"] = config.soft_mtp_adaptive_decoding_policy
         self.adapt_decode_policy = AdaptiveDecodingThresholdPolicy() if self.adapt_decode_type == "threshold" else None
+        self._threshold_tensor_cache = {}
 
         dist.init_process_group("nccl", config.dist_init_method, world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -366,6 +367,58 @@ class ModelRunner:
         mtp_temperatures = torch.tensor(mtp_temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures, mtp_temperatures
 
+    @staticmethod
+    def _all_greedy(temperatures: list[float]) -> bool:
+        return all(temp <= 1e-5 for temp in temperatures)
+
+    def _ntp_is_greedy(self, seqs: list[Sequence]) -> bool:
+        return self._all_greedy([seq.temperature for seq in seqs])
+
+    def _mtp_is_greedy(self, seqs: list[Sequence]) -> bool:
+        temperatures = []
+        for seq in seqs:
+            if seq.soft_mtp_params is None:
+                temperatures.append(seq.temperature)
+            else:
+                temperatures.append(seq.soft_mtp_params.mtp_temperature)
+        return self._all_greedy(temperatures)
+
+    def _sample_tokens(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        *,
+        greedy: bool,
+    ) -> torch.Tensor:
+        if greedy:
+            return logits.argmax(dim=-1)
+        return self.sampler(logits, temperatures)
+
+    def _adaptive_threshold_tensors(
+        self,
+        seqs: list[Sequence],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ntp_values = []
+        mtp_values = []
+        for seq in seqs:
+            if seq.soft_mtp_params is not None and seq.soft_mtp_params.adaptive_threshold is not None:
+                ntp_th, mtp_th = seq.soft_mtp_params.adaptive_threshold
+            else:
+                ntp_th, mtp_th = 0, 0
+            ntp_values.append(float(ntp_th))
+            mtp_values.append(float(mtp_th))
+
+        cache_key = (tuple(ntp_values), tuple(mtp_values), str(device))
+        cached = self._threshold_tensor_cache.get(cache_key)
+        if cached is None:
+            cached = (
+                torch.tensor(ntp_values, dtype=torch.float32, device=device),
+                torch.tensor(mtp_values, dtype=torch.float32, device=device),
+            )
+            self._threshold_tensor_cache[cache_key] = cached
+        return cached
+
     def _compute_slot_mapping(self, seq: Sequence, p: int) -> list[int]:
         """Compute slot mapping for given positions in a sequence."""
         return seq.block_table[p // self.block_size] * self.block_size + p % self.block_size
@@ -577,7 +630,7 @@ class ModelRunner:
 
         # Compute NTP logits and sample
         ntp_logits = self.model.compute_logits(last_ntp_hidden)
-        ntp_tokens = self.sampler(ntp_logits, temperatures)
+        ntp_tokens = self._sample_tokens(ntp_logits, temperatures, greedy=self._ntp_is_greedy(seqs))
 
         # MTP decode for next prediction
         mtp_positions = self.prepare_soft_mtp_prefill_decode(seqs)
@@ -641,7 +694,7 @@ class ModelRunner:
         last_ntp_hidden = ans_ntp_hidden_states[last_indices].contiguous()
 
         ntp_logits = self.model.compute_logits(last_ntp_hidden)
-        token_ids = self.sampler(ntp_logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self._sample_tokens(ntp_logits, temperatures, greedy=self._ntp_is_greedy(seqs)).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
@@ -678,7 +731,7 @@ class ModelRunner:
         last_ntp_hidden = self._extract_last_hidden_per_seq(ntp_hidden_states, context.cu_seqlens_q)
 
         # TODO: sync across all ranks
-        ntp_tokens = self.sampler(ntp_logits, temperatures)
+        ntp_tokens = self._sample_tokens(ntp_logits, temperatures, greedy=self._ntp_is_greedy(seqs))
 
         reset_context()
         mtp_hidden_states = self._run_initial_mtp_decode(seqs, last_ntp_hidden, ntp_tokens)
@@ -696,19 +749,24 @@ class ModelRunner:
         positions: torch.Tensor,
         mtp_positions: torch.Tensor,
         temperatures: torch.Tensor,
+        *,
+        greedy: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ntp_hidden_states, multi_input_embeds = self.model.ntp_decode(mtp_input_ids, positions)
         ntp_logits = self.model.compute_logits(ntp_hidden_states)
         # TODO: sync across all ranks
-        ntp_tokens = self.sampler(ntp_logits, temperatures)
+        ntp_tokens = self._sample_tokens(ntp_logits, temperatures, greedy=greedy)
         mtp_hidden_states = self.model.mtp_decode(multi_input_embeds, ntp_hidden_states, ntp_tokens, mtp_positions)
         return ntp_tokens, ntp_logits, mtp_hidden_states
 
     @torch.inference_mode()
     def run_model_mtp_decode(self, seqs: list[Sequence], temperatures: torch.Tensor, mtp_temperatures: torch.Tensor) -> list[list[int]] | None:
         mtp_input_ids, positions, mtp_positions = self.prepare_soft_mtp_decode(seqs)
-        if self.enforce_eager or mtp_input_ids.size(0) > BATCH_SIZE_LIMIT:
-            ntp_tokens, ntp_logits, mtp_hidden_states = self._run_model_mtp_decode(mtp_input_ids, positions, mtp_positions, temperatures)
+        ntp_greedy = self._ntp_is_greedy(seqs)
+        if self.enforce_eager or not ntp_greedy or mtp_input_ids.size(0) > BATCH_SIZE_LIMIT:
+            ntp_tokens, ntp_logits, mtp_hidden_states = self._run_model_mtp_decode(
+                mtp_input_ids, positions, mtp_positions, temperatures, greedy=ntp_greedy
+            )
         else:
             bs = mtp_input_ids.size(0)
             context = get_context(DEFAULT_CONTEXT_KEY)
@@ -718,7 +776,6 @@ class ModelRunner:
             graph_vars["multi_input_ids"][:bs] = mtp_input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["mtp_positions"][:bs] = mtp_positions
-            graph_vars["temperatures"][:bs] = temperatures
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["mtp_slot_mapping"].fill_(-1)
@@ -743,27 +800,10 @@ class ModelRunner:
     def _sample_mtp_logits(self, seqs: list[Sequence], mtp_logits: torch.Tensor, ntp_logits: torch.Tensor, mtp_temperatures: torch.Tensor) -> torch.Tensor:
         mtp_tokens = None
         if self.rank == 0:
-            mtp_tokens = self.sampler(mtp_logits, mtp_temperatures)
+            mtp_tokens = self._sample_tokens(mtp_logits, mtp_temperatures, greedy=self._mtp_is_greedy(seqs))
             ignore_mtp_tokens = torch.zeros_like(mtp_tokens, dtype=torch.bool).cuda(non_blocking=True)
             if self.adapt_decode_type == "threshold":
-                ntp_thresholds = torch.tensor(
-                    [
-                        seq.soft_mtp_params.adaptive_threshold[0]
-                            if (seq.soft_mtp_params is not None and seq.soft_mtp_params.adaptive_threshold is not None)
-                            else 0
-                        for seq in seqs
-                    ],
-                    dtype=torch.float32,
-                ).cuda(non_blocking=True)
-                mtp_thresholds = torch.tensor(
-                    [
-                        seq.soft_mtp_params.adaptive_threshold[1]
-                            if (seq.soft_mtp_params is not None and seq.soft_mtp_params.adaptive_threshold is not None)
-                            else 0
-                        for seq in seqs
-                    ],
-                    dtype=torch.float32,
-                ).cuda(non_blocking=True)
+                ntp_thresholds, mtp_thresholds = self._adaptive_threshold_tensors(seqs, mtp_logits.device)
                 ignore_mtp_tokens = self.adapt_decode_policy(ntp_logits, mtp_logits, ntp_thresholds, mtp_thresholds)
             mtp_tokens[ignore_mtp_tokens] = sequence.COT_PAD_TOKEN_ID
         return mtp_tokens
@@ -784,7 +824,11 @@ class ModelRunner:
             if self.rank == 0:
                 temperatures, _ = self.prepare_sample(seqs)
                 logits = self.run_model(seqs, is_prefill=is_prefill)
-                token_ids = self.sampler(logits, temperatures).tolist()
+                token_ids = self._sample_tokens(
+                    logits,
+                    temperatures,
+                    greedy=self.soft_mtp_enabled and self._ntp_is_greedy(seqs),
+                ).tolist()
             else:
                 token_ids = None
         else:
@@ -860,10 +904,14 @@ class ModelRunner:
                 graph = torch.cuda.CUDAGraph()
                 set_context(DEFAULT_CONTEXT_KEY, False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
                 set_context(MTP_MODULE_CONTEXT_KEY, False, slot_mapping=mtp_slot_mapping[:bs], context_lens=mtp_context_lens[:bs], block_tables=block_tables[:bs])
-                ntp_tokens[:bs], ntp_logits[:bs], mtp_outputs[:bs] = self._run_model_mtp_decode(multi_input_ids[:bs], positions[:bs], mtp_positions[:bs], temperatures[:bs])    # warmup
+                ntp_tokens[:bs], ntp_logits[:bs], mtp_outputs[:bs] = self._run_model_mtp_decode(
+                    multi_input_ids[:bs], positions[:bs], mtp_positions[:bs], temperatures[:bs], greedy=True
+                )    # warmup
                 # use the same graph pool as the ntp graph
                 with torch.cuda.graph(graph, self.graph_pool):
-                    ntp_tokens[:bs], ntp_logits[:bs], mtp_outputs[:bs] = self._run_model_mtp_decode(multi_input_ids[:bs], positions[:bs], mtp_positions[:bs], temperatures[:bs])    # capture
+                    ntp_tokens[:bs], ntp_logits[:bs], mtp_outputs[:bs] = self._run_model_mtp_decode(
+                        multi_input_ids[:bs], positions[:bs], mtp_positions[:bs], temperatures[:bs], greedy=True
+                    )    # capture
                 self.mtp_graphs[bs] = graph
                 torch.cuda.synchronize()
                 reset_context()
